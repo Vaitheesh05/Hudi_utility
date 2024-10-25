@@ -22,7 +22,8 @@ class HudiTransaction(Base):
     __tablename__ = "hudi_transactions"
     
     id = Column(Integer, primary_key=True, index=True)
-    transaction_id = Column(String, default=lambda: str(uuid.uuid4()), unique=True, index=True)
+    transaction_id = Column(String, unique=True, index=True)
+    #job_id = Column(String, nullable=True)
     status = Column(String, default="PENDING")  # PENDING, FAILED, SUCCESS
     log = Column(Text, nullable=True)
     transaction_data = Column(Text, nullable=False)
@@ -43,11 +44,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Consider specifying allowed origins for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Define input schema
 class HudiBootstrapRequest(BaseModel):
@@ -60,17 +62,17 @@ class HudiBootstrapRequest(BaseModel):
     write_operation: str  # insert or upsert
     output_path: str
     spark_config: Optional[dict] = None  # Optional spark configurations
-    schema_validation: bool = False  # Changed to boolean
-    dry_run: bool = False  # Changed to boolean
+    schema_validation: bool = False
+    dry_run: bool = False
     bootstrap_type: str  # FULL_RECORD or METADATA_ONLY
     partition_regex: Optional[str] = None  # Optional regex for partitions
 
-# Define the API endpoint
 @app.post("/bootstrap_hudi/")
-def bootstrap_hudi(request: HudiBootstrapRequest,db: Session = Depends(get_db)):
+def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db)):
     try:
-        # Build the spark-submit command
+        transaction_id = f"{request.hudi_table_name}-{int(datetime.utcnow().timestamp())}"
         transaction = HudiTransaction(
+            transaction_id=transaction_id,
             status="PENDING",
             transaction_data=json.dumps(request.dict()),
             start_time=datetime.utcnow(),
@@ -78,11 +80,13 @@ def bootstrap_hudi(request: HudiBootstrapRequest,db: Session = Depends(get_db)):
         db.add(transaction)
         db.commit()
         db.refresh(transaction)
+
+        # Build the spark-submit command
         spark_submit_command = [
             "spark-submit",
-            "--master", "local",  # or the appropriate cluster manager URL
+            "--master", "local",
             "--conf", f"spark.executor.memory={request.spark_config.get('spark.executor.memory', '2g') if request.spark_config else '2g'}",
-            "/home/labuser/Desktop/Persistant_Folder/utility/fastapi-backend/pyspark_script.py",  # The path to your PySpark script
+            "/home/labuser/Desktop/Persistant_Folder/utility/fastapi-backend/pyspark_script.py",
             f"--data-file-path={request.data_file_path}",
             f"--hudi-table-name={request.hudi_table_name}",
             f"--key-field={request.key_field}",
@@ -108,12 +112,9 @@ def bootstrap_hudi(request: HudiBootstrapRequest,db: Session = Depends(get_db)):
             raise Exception(result.stderr)  # Raise error if subprocess fails
 
         transaction.end_time = datetime.utcnow()
-        if result.returncode == 0:
-            transaction.status = "SUCCESS"
-            transaction.log = result.stdout
-        else:
-            transaction.status = "FAILED"
-            transaction.log = result.stderr
+        #transaction.job_id = "JobID_placeholder"  # Replace with actual job ID retrieval if applicable
+        transaction.status = "SUCCESS" if result.returncode == 0 else "FAILED"
+        transaction.log = result.stdout if transaction.status == "SUCCESS" else result.stderr
         
         db.commit()
 
@@ -126,9 +127,20 @@ def bootstrap_hudi(request: HudiBootstrapRequest,db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
-# Add any other endpoints as needed
 @app.get("/bootstrap_history/")
-def get_bootstrap_history(db: Session = Depends(get_db)):
-    transactions = db.query(HudiTransaction).order_by(HudiTransaction.start_time.desc()).all()
+def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[str] = None, transaction_id: Optional[str] = None, db: Session = Depends(get_db)):
+    query = db.query(HudiTransaction)
+    
+    if transaction_id:
+        query = query.filter(HudiTransaction.transaction_id.like(f"%{transaction_id}%"))
+    
+    if start_date:
+        query = query.filter(HudiTransaction.start_time >= datetime.fromisoformat(start_date))
+    
+    if end_date:
+        end_date_obj = datetime.fromisoformat(end_date)
+        end_date_end_of_day = end_date_obj.replace(hour=23, minute=59, second=59, microsecond=999999)
+        query = query.filter(HudiTransaction.start_time <= end_date_end_of_day)
+    
+    transactions = query.order_by(HudiTransaction.start_time.desc()).all()
     return transactions
-

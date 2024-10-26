@@ -8,6 +8,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
 import uuid
 import json
+import os
 
 
 # Database configuration
@@ -81,12 +82,15 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
         db.commit()
         db.refresh(transaction)
 
+        current_directory = os.path.dirname(os.path.abspath(__file__))
+        pyspark_script_path = os.path.join(current_directory, "pyspark_script.py")
+
         # Build the spark-submit command
         spark_submit_command = [
             "spark-submit",
             "--master", "local",
             "--conf", f"spark.executor.memory={request.spark_config.get('spark.executor.memory', '2g') if request.spark_config else '2g'}",
-            "/home/labuser/Desktop/Persistant_Folder/utility/fastapi-backend/pyspark_script.py",
+            pyspark_script_path,
             f"--data-file-path={request.data_file_path}",
             f"--hudi-table-name={request.hudi_table_name}",
             f"--key-field={request.key_field}",

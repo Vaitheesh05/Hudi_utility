@@ -1,5 +1,9 @@
 from pyspark.sql import SparkSession
 import argparse
+from pathlib import Path
+import pydoop.hdfs as hdfs
+import os
+import re
 
 # Parse the command-line arguments
 parser = argparse.ArgumentParser(description="Bootstrap Hudi Table using DataSource Writer")
@@ -21,20 +25,25 @@ spark = SparkSession.builder \
     .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
     .getOrCreate()
 
-# Load the Parquet file
-#input_df = spark.read.format("parquet").load(args.parquet_file_path)
+def get_first_file_extension(hdfs_path):
+    """Retrieve the extension of the first file found in HDFS."""
+    files = hdfs.ls(hdfs_path)
+    for item in files:
+        if hdfs.path.isfile(item):
+            return Path(item).suffix.lower()
+        elif hdfs.path.isdir(item):
+            file_extension = get_first_file_extension(item)
+            if file_extension:
+                return file_extension
+    return None
 
+# Get the file extension of the first file
+file_extension = get_first_file_extension(args.data_file_path)
 
-# Get the file format
-#file_extension = '.parquet'
-
-
-file_extension = 'parquet'
-
-if file_extension == "parquet":
+if file_extension == ".parquet":
 # Try reading the file as a Parquet file
 	input_df = spark.read.format("parquet").load(args.data_file_path)
-elif file_extension == "orc":
+elif file_extension == ".orc":
 	input_df = spark.read.format("orc").load(args.data_file_path)
 else:
     	raise ValueError("Unsupported file format. Please provide a .parquet or .orc file.")

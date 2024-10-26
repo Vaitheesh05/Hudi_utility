@@ -98,12 +98,6 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
             f"--bootstrap-type={request.bootstrap_type}",
             f"--partition-regex={request.partition_regex}" if request.partition_regex else ""
         ]
-	
-        if request.schema_validation:
-            spark_submit_command.append("--enable-schema-validation")
-
-        if request.dry_run:
-            spark_submit_command.append("--dry-run")
 
         # Call Spark-submit
         result = subprocess.run(spark_submit_command, capture_output=True, text=True)

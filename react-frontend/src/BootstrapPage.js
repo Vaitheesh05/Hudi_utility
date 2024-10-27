@@ -58,23 +58,34 @@ const BootstrapPage = ({ reset }) => {
     };
 
     const handleSubmit = async (e) => {
-        e.preventDefault();
-        setLoading(true);
-        try {
-            const requestData = {
-                ...formData,
-                spark_config: formData.spark_config ? JSON.parse(formData.spark_config) : {}
-            };
-            
-            const response = await axios.post("http://127.0.0.1:8000/bootstrap_hudi/", requestData);
-            if (response.status === 200) {
-                setMessage({ text: response.data.message, severity: 'success' });
-            }
-        } catch (error) {
-            setMessage({ text: "Failed to bootstrap the Hudi table: " + error.response.data.detail, severity: 'error' });
-        }
-        setLoading(false);
-    };
+	    e.preventDefault();
+	    setLoading(true);
+	    try {
+		let sparkConfig = {};
+		try {
+		    sparkConfig = formData.spark_config ? JSON.parse(formData.spark_config) : {};
+		} catch (jsonError) {
+		    setMessage({ text: "Invalid Spark configuration JSON.", severity: 'error' });
+		    setLoading(false);
+		    return;
+		}
+		
+		const requestData = {
+		    ...formData,
+		    spark_config: sparkConfig
+		};
+		
+		const response = await axios.post("http://127.0.0.1:8000/bootstrap_hudi/", requestData);
+		if (response.status === 200) {
+		    setMessage({ text: response.data.message, severity: 'success' });
+		}
+	    } catch (error) {
+		const errorMessage = error.response?.data?.detail || "Failed to bootstrap the Hudi table.";
+		setMessage({ text: errorMessage, severity: 'error' });
+	    }
+	    setLoading(false);
+	};
+
 
     return (
         <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, padding: 2 }}>

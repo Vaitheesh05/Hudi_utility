@@ -6,7 +6,6 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
-import uuid
 import json
 import os
 
@@ -24,7 +23,6 @@ class HudiTransaction(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     transaction_id = Column(String, unique=True, index=True)
-    #job_id = Column(String, nullable=True)
     status = Column(String, default="PENDING")  # PENDING, FAILED, SUCCESS
     log = Column(Text, nullable=True)
     transaction_data = Column(Text, nullable=False)
@@ -88,20 +86,33 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
         # Build the spark-submit command
         spark_submit_command = [
             "spark-submit",
-            "--master", "local",
-            "--conf", f"spark.executor.memory={request.spark_config.get('spark.executor.memory', '2g') if request.spark_config else '2g'}",
-            pyspark_script_path,
-            f"--data-file-path={request.data_file_path}",
-            f"--hudi-table-name={request.hudi_table_name}",
-            f"--key-field={request.key_field}",
-            f"--precombine-field={request.precombine_field}",
-            f"--partition-field={request.partition_field}",
-            f"--hudi-table-type={request.hudi_table_type}",
-            f"--write-operation={request.write_operation}",
-            f"--output-path={request.output_path}",
-            f"--bootstrap-type={request.bootstrap_type}",
-            f"--partition-regex={request.partition_regex}" if request.partition_regex else ""
+            "--master", "local"
         ]
+        
+        # Add Spark configurations
+        # Add Spark configurations
+        if request.spark_config:
+            for key, value in request.spark_config.items():
+                spark_submit_command.append(f"--conf")
+                spark_submit_command.append(f"{key}={value}")
+        
+        spark_submit_command.append(pyspark_script_path)
+        # Append additional parameters
+        spark_submit_command.append(f"--data-file-path={request.data_file_path}")
+        spark_submit_command.append(f"--hudi-table-name={request.hudi_table_name}")
+        spark_submit_command.append(f"--key-field={request.key_field}")
+        spark_submit_command.append(f"--precombine-field={request.precombine_field}")
+        spark_submit_command.append(f"--partition-field={request.partition_field}")
+        spark_submit_command.append(f"--hudi-table-type={request.hudi_table_type}")
+        spark_submit_command.append(f"--write-operation={request.write_operation}")
+        spark_submit_command.append(f"--output-path={request.output_path}")
+        spark_submit_command.append(f"--bootstrap-type={request.bootstrap_type}")
+
+        # Append partition regex if it exists
+        spark_submit_command.append(f"--partition-regex={request.partition_regex}")
+        # Append Spark configurations to the command
+        
+
 
         # Call Spark-submit
         result = subprocess.run(spark_submit_command, capture_output=True, text=True)
@@ -110,8 +121,8 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
             raise Exception(result.stderr)  # Raise error if subprocess fails
 
         transaction.end_time = datetime.utcnow()
-        #transaction.job_id = "JobID_placeholder"  # Replace with actual job ID retrieval if applicable
-        transaction.status = "SUCCESS" if result.returncode == 0 else "FAILED"
+        # transaction.job_id = "JobID_placeholder"  # Replace with actual job ID retrieval if applicable
+        transaction.status = "SUCCESS"
         transaction.log = result.stdout if transaction.status == "SUCCESS" else result.stderr
         
         db.commit()

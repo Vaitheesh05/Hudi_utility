@@ -1,4 +1,4 @@
-```markdown
+
 # FastAPI and React Application
 
 This project consists of a FastAPI backend and a React frontend. The FastAPI backend handles data processing and storage in a PostgreSQL database, while the React frontend provides a user interface for interaction.

@@ -61,8 +61,6 @@ class HudiBootstrapRequest(BaseModel):
     write_operation: str  # insert or upsert
     output_path: str
     spark_config: Optional[dict] = None  # Optional spark configurations
-    schema_validation: bool = False
-    dry_run: bool = False
     bootstrap_type: str  # FULL_RECORD or METADATA_ONLY
     partition_regex: Optional[str] = None  # Optional regex for partitions
 

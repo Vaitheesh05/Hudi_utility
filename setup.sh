@@ -13,7 +13,7 @@ EOF
 
 
 # Install necessary Python libraries
-pip install fastapi uvicorn sqlalchemy psycopg2 pydantic
+pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic
 
 # Optionally install other libraries you might need for your project
 # pip install <other-libraries>

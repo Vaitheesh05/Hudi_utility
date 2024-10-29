@@ -9,7 +9,7 @@ const theme = createTheme({
             main: '#212636', // Example primary color
         },
         secondary: {
-            main: '#808080', // Example secondary color
+            main: '#635bff', // Example secondary color
         },
         background: {
             default: '#f4f4f4', // Default background color
@@ -20,6 +20,9 @@ const theme = createTheme({
             hover: '#212636', // Hover color (optional)
             selected: '#212636', // Selected color (optional)
         },
+    },
+    typography: {
+        fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
     },
     components: {
         MuiAppBar: {
@@ -77,6 +80,7 @@ const theme = createTheme({
         MuiTextField: {
             styleOverrides: {
                 root: {
+		    fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
                     '& .MuiOutlinedInput-root': {
                         '&:hover fieldset': {
                             borderColor: '#212636', // Border color on hover
@@ -90,9 +94,17 @@ const theme = createTheme({
                 },
             },
         },
+	MuiMenuItem: {
+            styleOverrides: {
+                root: {
+                    fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif', // Apply font family to MenuItem
+                },
+            },
+        },
         MuiDatePicker: {
             styleOverrides: {
                 root: {
+		    fontFamily: '"Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
                     '& .MuiOutlinedInput-root': {
                         '& fieldset': {
                             borderColor: '#212636', // Default border color

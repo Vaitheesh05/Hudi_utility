@@ -4,11 +4,11 @@ from typing import Optional
 import subprocess
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime
 import json
 import os
-
 
 # Database configuration
 DATABASE_URL = "postgresql://hudi_user:password@localhost/hudi_bootstrap_db"
@@ -49,7 +49,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # Define input schema
 class HudiBootstrapRequest(BaseModel):
     data_file_path: str
@@ -66,28 +65,27 @@ class HudiBootstrapRequest(BaseModel):
 
 @app.post("/bootstrap_hudi/")
 def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db)):
+    transaction_id = f"{request.hudi_table_name}-{int(datetime.utcnow().timestamp())}"
+    transaction = HudiTransaction(
+        transaction_id=transaction_id,
+        status="PENDING",
+        transaction_data=json.dumps(request.dict()),
+        start_time=datetime.utcnow(),
+    )
+    db.add(transaction)
+    db.commit()
+    db.refresh(transaction)
+
+    current_directory = os.path.dirname(os.path.abspath(__file__))
+    pyspark_script_path = os.path.join(current_directory, "pyspark_script.py")
+
     try:
-        transaction_id = f"{request.hudi_table_name}-{int(datetime.utcnow().timestamp())}"
-        transaction = HudiTransaction(
-            transaction_id=transaction_id,
-            status="PENDING",
-            transaction_data=json.dumps(request.dict()),
-            start_time=datetime.utcnow(),
-        )
-        db.add(transaction)
-        db.commit()
-        db.refresh(transaction)
-
-        current_directory = os.path.dirname(os.path.abspath(__file__))
-        pyspark_script_path = os.path.join(current_directory, "pyspark_script.py")
-
         # Build the spark-submit command
         spark_submit_command = [
             "spark-submit",
             "--master", "local"
         ]
         
-        # Add Spark configurations
         # Add Spark configurations
         if request.spark_config:
             for key, value in request.spark_config.items():
@@ -108,18 +106,33 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
 
         # Append partition regex if it exists
         spark_submit_command.append(f"--partition-regex={request.partition_regex}")
-        # Append Spark configurations to the command
-        
-
 
         # Call Spark-submit
         result = subprocess.run(spark_submit_command, capture_output=True, text=True)
 
+        # Modify the error handling section in the bootstrap_hudi function
         if result.returncode != 0:
-            raise Exception(result.stderr)  # Raise error if subprocess fails
+            with open("pyspark_script.log", "r") as f:
+                error_log = f.read()
+
+            os.remove("pyspark_script.log")
+	    # More specific error message parsing
+            if "Configuration Error:" in error_log:
+                error_message = "Configuration Error: " + error_log.split("Configuration Error:")[1].strip().split("\n")[0]
+            elif "Permission Denied:" in error_log:
+                error_message = "Access Permission Error: " + error_log.split("Permission Denied Error:")[1].strip().split("\n")[0]
+            elif "Unsupported file format:" in error_log:
+                error_message = "Unsupported File Format: Only .parquet and .orc files are supported."
+            else:
+                error_message = "An Unexpected error occurred during Hudi table Bootstrap"
+ 
+            transaction.status = "FAILED"
+            transaction.log = error_log
+            transaction.end_time = datetime.utcnow()
+            db.commit()
+            return JSONResponse(status_code=500, content={"message": error_message,"detail": error_log})
 
         transaction.end_time = datetime.utcnow()
-        # transaction.job_id = "JobID_placeholder"  # Replace with actual job ID retrieval if applicable
         transaction.status = "SUCCESS"
         transaction.log = result.stdout if transaction.status == "SUCCESS" else result.stderr
         
@@ -132,7 +145,8 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
         transaction.status = "FAILED"
         transaction.log = str(e)
         db.commit()
-        raise HTTPException(status_code=500, detail=str(e))
+        
+        return JSONResponse(status_code=500, content={"message": "Error while Running Spark Submit","detail": str(e)})
 
 @app.get("/bootstrap_history/")
 def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[str] = None, transaction_id: Optional[str] = None, db: Session = Depends(get_db)):

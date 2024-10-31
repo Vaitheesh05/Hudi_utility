@@ -42,9 +42,9 @@ file_extension = get_first_file_extension(args.data_file_path)
 
 if file_extension == ".parquet":
 # Try reading the file as a Parquet file
-	input_df = spark.read.format("parquet").load(args.data_file_path)
+	input_df = spark.read.option("mergeSchema", "true").format("parquet").load(args.data_file_path)
 elif file_extension == ".orc":
-	input_df = spark.read.format("orc").load(args.data_file_path)
+	input_df = spark.read.option("mergeSchema", "true").format("orc").load(args.data_file_path)
 else:
     	raise ValueError("Unsupported file format. Please provide a .parquet or .orc file.")
    
@@ -59,9 +59,9 @@ input_df.write.format("hudi") \
     .option("hoodie.bootstrap.mode", args.bootstrap_type) \
     .option("hoodie.bootstrap.partition.regex", args.partition_regex) \
     .option("hoodie.table.name", args.hudi_table_name) \
+    .option("hoodie.schema.on.read.enable","true") \
     .option('hoodie.upsert.shuffle.parallelism', 2) \
     .mode("Overwrite") \
     .save(args.output_path)
 
 spark.stop()
-

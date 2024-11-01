@@ -6,9 +6,10 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from datetime import datetime
+from datetime import datetime,timedelta
 import json
 import os
+import re
 
 # Database configuration
 DATABASE_URL = "postgresql://hudi_user:password@localhost/hudi_bootstrap_db"
@@ -24,10 +25,10 @@ class HudiTransaction(Base):
     id = Column(Integer, primary_key=True, index=True)
     transaction_id = Column(String, unique=True, index=True)
     status = Column(String, default="PENDING")  # PENDING, FAILED, SUCCESS
-    log = Column(Text, nullable=True)
     transaction_data = Column(Text, nullable=False)
     start_time = Column(DateTime, default=datetime.utcnow)
     end_time = Column(DateTime, nullable=True)
+    app_id = Column(String, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -109,13 +110,18 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
 
         # Call Spark-submit
         result = subprocess.run(spark_submit_command, capture_output=True, text=True)
+        
+        app_id_match = re.search(r'local-\d{13}', result.stderr)
+        if app_id_match:
+            app_id = app_id_match.group(0)
+            transaction.app_id = app_id
+            db.commit()
 
         # Modify the error handling section in the bootstrap_hudi function
         if result.returncode != 0:
             with open("pyspark_script.log", "r") as f:
                 error_log = f.read()
 
-            os.remove("pyspark_script.log")
 	    # More specific error message parsing
             if "Configuration Error:" in error_log:
                 error_message = "Configuration Error: " + error_log.split("Configuration Error:")[1].strip().split("\n")[0]
@@ -127,14 +133,15 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
                 error_message = "An Unexpected error occurred during Hudi table Bootstrap"
  
             transaction.status = "FAILED"
-            transaction.log = error_log
             transaction.end_time = datetime.utcnow()
             db.commit()
             return JSONResponse(status_code=500, content={"message": error_message,"detail": error_log})
 
+        if os.path.exists("pyspark_script.log"):
+            os.remove("pyspark_script.log")
+
         transaction.end_time = datetime.utcnow()
         transaction.status = "SUCCESS"
-        transaction.log = result.stdout if transaction.status == "SUCCESS" else result.stderr
         
         db.commit()
 
@@ -143,7 +150,6 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
     except Exception as e:
         transaction.end_time = datetime.utcnow()
         transaction.status = "FAILED"
-        transaction.log = str(e)
         db.commit()
         
         return JSONResponse(status_code=500, content={"message": "Error while Running Spark Submit","detail": str(e)})
@@ -160,8 +166,8 @@ def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[s
     
     if end_date:
         end_date_obj = datetime.fromisoformat(end_date)
-        end_date_end_of_day = end_date_obj.replace(hour=23, minute=59, second=59, microsecond=999999)
-        query = query.filter(HudiTransaction.start_time <= end_date_end_of_day)
+        end_time = end_date_obj + timedelta(days=1)
+        query = query.filter(HudiTransaction.start_time < end_time)
     
     transactions = query.order_by(HudiTransaction.start_time.desc()).all()
     return transactions

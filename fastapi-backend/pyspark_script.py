@@ -147,10 +147,7 @@ try:
     if record_count == 0:
         raise ValueError("Input dataframe is empty. No records to process.")
 
-    # Detailed logging of input dataframe characteristics
-    logging.info(f"Input dataframe characteristics:")
-    logging.info(f"Record count: {record_count}")
-    logging.info(f"Schema: {input_df.schema}")
+
 
     # Write to Hudi with comprehensive configuration
     input_df.write.format("hudi") \
@@ -168,10 +165,6 @@ try:
         .save(args.output_path)
 
     # Log success message with more details
-    logging.info(f"Hudi table bootstrapped successfully.")
-    logging.info(f"Table Name: {args.hudi_table_name}")
-    logging.info(f"Output Path: {args.output_path}")
-    print("Hudi table bootstrapped successfully.")
 
 except ValueError as ve:
     # Detailed logging for validation and configuration errors

@@ -121,7 +121,7 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
         if result.returncode != 0:
             with open("pyspark_script.log", "r") as f:
                 error_log = f.read()
-
+            os.remove("pyspark_script.log")
 	    # More specific error message parsing
             if "Configuration Error:" in error_log:
                 error_message = "Configuration Error: " + error_log.split("Configuration Error:")[1].strip().split("\n")[0]

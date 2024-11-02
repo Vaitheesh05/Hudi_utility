@@ -98,6 +98,28 @@ def get_first_file_extension(hdfs_path):
         logging.error(f"Error in get_first_file_extension: {traceback.format_exc()}")
         raise ValueError(f"Error processing HDFS path {hdfs_path}: {str(e)}")
 
+def validate_fields_in_schema(input_df, args):
+    """Validate key_field, precombine_field, and partition_field against the input DataFrame schema."""
+    errors = []
+    schema_fields = input_df.schema.fieldNames()
+    
+    # Validate key fields (multiple fields separated by commas)
+    key_fields = args.key_field.split(',')
+    missing_key_fields = [field for field in key_fields if field not in schema_fields]
+    if missing_key_fields:
+        errors.append(f"Key fields missing in schema: {', '.join(missing_key_fields)}")
+
+    # Validate precombine field
+    if args.precombine_field not in schema_fields:
+        errors.append(f"Precombine field '{args.precombine_field}' not found in schema.")
+
+    # Validate partition field
+    if args.partition_field not in schema_fields:
+        errors.append(f"Partition field '{args.partition_field}' not found in schema.")
+    
+    if errors:
+        raise ValueError("\n".join(errors))
+
 # Parse the command-line arguments
 parser = argparse.ArgumentParser(description="Bootstrap Hudi Table using DataSource Writer")
 parser.add_argument("--data-file-path", required=True)
@@ -141,6 +163,8 @@ try:
     except Exception as read_error:
         logging.error(f"Error reading input file: {str(read_error)}")
         raise ValueError(f"Failed to read input file: {str(read_error)}")
+
+    validate_fields_in_schema(input_df, args)
 
     # Verify input dataframe
     record_count = input_df.count()

@@ -46,10 +46,6 @@ def validate_input_arguments(args):
         if args.hudi_table_type not in valid_table_types:
             errors.append(f"Invalid Hudi table type. Supported types are: {', '.join(valid_table_types)}")
         
-        # Write operation validation
-        valid_write_ops = ["insert", "upsert"]
-        if args.write_operation not in valid_write_ops:
-            errors.append(f"Invalid write operation. Supported operations are: {', '.join(valid_write_ops)}")
         
         # Output path validation
         if not args.output_path or not args.output_path.strip():
@@ -195,7 +191,6 @@ parser.add_argument("--key-field", required=True)
 parser.add_argument("--precombine-field", required=True)
 parser.add_argument("--partition-field", required=False)  # Make optional
 parser.add_argument("--hudi-table-type", required=True)
-parser.add_argument("--write-operation", required=True)
 parser.add_argument("--output-path", required=True)
 parser.add_argument("--bootstrap-type", required=True)
 parser.add_argument("--partition-regex", required=False)  # Make optional
@@ -244,7 +239,6 @@ try:
 
     # Write to Hudi with comprehensive configuration
     write_config = {
-        "hoodie.datasource.write.operation": args.write_operation,
         "hoodie.datasource.write.table.type": args.hudi_table_type,
         "hoodie.datasource.write.recordkey.field": args.key_field,
         "hoodie.datasource.write.precombine.field": args.precombine_field,

@@ -59,7 +59,6 @@ class HudiBootstrapRequest(BaseModel):
     precombine_field: str
     partition_field: Optional[str] = None
     hudi_table_type: str  # COPY_ON_WRITE or MERGE_ON_READ
-    write_operation: str  # insert or upsert
     output_path: str
     spark_config: Optional[dict] = None  # Optional spark configurations
     bootstrap_type: str  # FULL_RECORD or METADATA_ONLY
@@ -91,7 +90,6 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
         spark_submit_command.append(f"--partition-field={request.partition_field}")
 
     spark_submit_command.append(f"--hudi-table-type={request.hudi_table_type}")
-    spark_submit_command.append(f"--write-operation={request.write_operation}")
     spark_submit_command.append(f"--output-path={request.output_path}")
     spark_submit_command.append(f"--bootstrap-type={request.bootstrap_type}")
 

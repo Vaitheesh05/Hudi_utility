@@ -113,12 +113,71 @@ def validate_fields_in_schema(input_df, args):
     if args.precombine_field not in schema_fields:
         errors.append(f"Precombine field '{args.precombine_field}' not found in schema.")
 
-    # Validate partition field
-    if args.partition_field not in schema_fields:
+    # Validate partition field only if it's provided
+    if args.partition_field and args.partition_field not in schema_fields:
         errors.append(f"Partition field '{args.partition_field}' not found in schema.")
     
     if errors:
         raise ValueError("\n".join(errors))
+
+def validate_post_bootstrap(spark, output_path, input_df,bootstrap_type, partition_regex=None):
+    """Validate the Hudi table written to the output path against the input DataFrame."""
+    try:
+        # Read the Hudi table from the output path
+        hudi_df = spark.read.format("hudi").load(output_path)
+
+        # Get the schema of both DataFrames
+        input_schema = input_df.schema
+        hudi_schema = hudi_df.schema
+
+        # Extract user-defined columns from input schema
+        input_columns = {field.name: field.dataType for field in input_schema.fields}
+        hudi_columns = {field.name: field.dataType for field in hudi_schema.fields if not field.name.startswith("_")}
+
+        # Validate schema: Check if the input DataFrame columns exist in the Hudi table
+        for column_name, input_type in input_columns.items():
+            if column_name not in hudi_columns:
+                raise ValueError(f"Column '{column_name}' from input DataFrame is missing in Hudi table.")
+            
+            hudi_type = hudi_columns[column_name]
+            if input_type != hudi_type:
+                raise ValueError(f"Data type mismatch for column '{column_name}': "
+                                 f"Input type '{input_type}' vs Hudi type '{hudi_type}'.")
+
+        # Check record count only if FULL_RECORD bootstrap is being performed
+        if bootstrap_type == "FULL_RECORD":
+            if partition_regex:
+                # Collect distinct partitions from the input DataFrame
+                input_partitions = input_df.select(args.partition_field).distinct().collect()
+                full_record_count = 0
+
+                for partition in input_partitions:
+                    partition_value = partition[0]
+                    if re.match(partition_regex, partition_value):
+                        # Count records in the input DataFrame that match the partition regex
+                        full_record_count += input_df.filter(input_df[args.partition_field] == partition_value).count()
+
+                # Now check against the Hudi table
+                hudi_record_count = hudi_df.count()
+
+                if full_record_count != hudi_record_count:
+                    raise ValueError(f"Record count mismatch for partitions matching regex: "
+                                     f"Input has {full_record_count} records, Hudi table has {hudi_record_count} records.")
+            else:
+                # Check total record count if no regex is provided
+                input_count = input_df.count()
+                hudi_count = hudi_df.count()
+
+                if input_count != hudi_count:
+                    raise ValueError(f"Record count mismatch: Input has {input_count} records, "
+                                     f"Hudi table has {hudi_count} records.")
+
+        print("Post-bootstrap validation successful: Schema, data types, and record count match.")
+
+    except Exception as validation_error:
+        logging.error(f"Post-bootstrap validation error: {str(validation_error)}")
+        raise ValueError(f"Post-bootstrap validation failed: {str(validation_error)}")
+
 
 # Parse the command-line arguments
 parser = argparse.ArgumentParser(description="Bootstrap Hudi Table using DataSource Writer")
@@ -126,12 +185,12 @@ parser.add_argument("--data-file-path", required=True)
 parser.add_argument("--hudi-table-name", required=True)
 parser.add_argument("--key-field", required=True)
 parser.add_argument("--precombine-field", required=True)
-parser.add_argument("--partition-field", required=True)
+parser.add_argument("--partition-field", required=False)  # Make optional
 parser.add_argument("--hudi-table-type", required=True)
 parser.add_argument("--write-operation", required=True)
 parser.add_argument("--output-path", required=True)
 parser.add_argument("--bootstrap-type", required=True)
-parser.add_argument("--partition-regex", required=True)
+parser.add_argument("--partition-regex", required=False)  # Make optional
 args = parser.parse_args()
 
 spark = None
@@ -171,22 +230,30 @@ try:
     if record_count == 0:
         raise ValueError("Input dataframe is empty. No records to process.")
 
-
-
     # Write to Hudi with comprehensive configuration
+    write_config = {
+        "hoodie.datasource.write.operation": args.write_operation,
+        "hoodie.datasource.write.table.type": args.hudi_table_type,
+        "hoodie.datasource.write.recordkey.field": args.key_field,
+        "hoodie.datasource.write.precombine.field": args.precombine_field,
+        "hoodie.table.name": args.hudi_table_name,
+        "hoodie.schema.on.read.enable": "true",
+        "hoodie.upsert.shuffle.parallelism": 2,
+        "hoodie.bootstrap.mode": args.bootstrap_type
+    }
+
+    # Add optional parameters if provided
+    if args.partition_field:
+        write_config["hoodie.datasource.write.partitionpath.field"] = args.partition_field
+    if args.partition_regex:
+        write_config["hoodie.bootstrap.partition.regex"] = args.partition_regex
+
     input_df.write.format("hudi") \
-        .option("hoodie.datasource.write.operation", args.write_operation) \
-        .option("hoodie.datasource.write.table.type", args.hudi_table_type) \
-        .option("hoodie.datasource.write.recordkey.field", args.key_field) \
-        .option("hoodie.datasource.write.precombine.field", args.precombine_field) \
-        .option("hoodie.datasource.write.partitionpath.field", args.partition_field) \
-        .option("hoodie.bootstrap.mode", args.bootstrap_type) \
-        .option("hoodie.bootstrap.partition.regex", args.partition_regex) \
-        .option("hoodie.table.name", args.hudi_table_name) \
-        .option("hoodie.schema.on.read.enable", "true") \
-        .option("hoodie.upsert.shuffle.parallelism", 2) \
+        .options(**write_config) \
         .mode("Overwrite") \
         .save(args.output_path)
+
+    validate_post_bootstrap(spark, args.output_path, input_df,args.bootstrap_type, args.partition_regex)
 
     # Log success message with more details
 

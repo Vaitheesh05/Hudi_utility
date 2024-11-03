@@ -1,15 +1,15 @@
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
-import subprocess
-from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
-from fastapi.responses import JSONResponse
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
-from datetime import datetime,timedelta
+from datetime import datetime, timedelta
 import json
 import os
 import re
+import subprocess
 
 # Database configuration
 DATABASE_URL = "postgresql://hudi_user:password@localhost/hudi_bootstrap_db"
@@ -56,7 +56,7 @@ class HudiBootstrapRequest(BaseModel):
     hudi_table_name: str
     key_field: str
     precombine_field: str
-    partition_field: str
+    partition_field: Optional[str] = None
     hudi_table_type: str  # COPY_ON_WRITE or MERGE_ON_READ
     write_operation: str  # insert or upsert
     output_path: str
@@ -99,14 +99,16 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
         spark_submit_command.append(f"--hudi-table-name={request.hudi_table_name}")
         spark_submit_command.append(f"--key-field={request.key_field}")
         spark_submit_command.append(f"--precombine-field={request.precombine_field}")
-        spark_submit_command.append(f"--partition-field={request.partition_field}")
+        if request.partition_field:
+            spark_submit_command.append(f"--partition-field={request.partition_field}")
+
         spark_submit_command.append(f"--hudi-table-type={request.hudi_table_type}")
         spark_submit_command.append(f"--write-operation={request.write_operation}")
         spark_submit_command.append(f"--output-path={request.output_path}")
         spark_submit_command.append(f"--bootstrap-type={request.bootstrap_type}")
 
-        # Append partition regex if it exists
-        spark_submit_command.append(f"--partition-regex={request.partition_regex}")
+        if request.partition_regex:
+            spark_submit_command.append(f"--partition-regex={request.partition_regex}")
 
         # Call Spark-submit
         result = subprocess.run(spark_submit_command, capture_output=True, text=True)
@@ -119,30 +121,24 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
 
         # Modify the error handling section in the bootstrap_hudi function
         if result.returncode != 0:
-            with open("pyspark_script.log", "r") as f:
-                error_log = f.read()
-            os.remove("pyspark_script.log")
-	    # More specific error message parsing
-            if "Configuration Error:" in error_log:
-                error_message = "Configuration Error: " + error_log.split("Configuration Error:")[1].strip().split("\n")[0]
-            elif "Permission Denied:" in error_log:
-                error_message = "Access Permission Error: " + error_log.split("Permission Denied Error:")[1].strip().split("\n")[0]
-            elif "Unsupported file format:" in error_log:
-                error_message = "Unsupported File Format: Only .parquet and .orc files are supported."
+            if os.path.exists("pyspark_script.log"):
+                with open("pyspark_script.log", "r") as f:
+                    error_log = f.read()
+                os.remove("pyspark_script.log")
             else:
-                error_message = "An Unexpected error occurred during Hudi table Bootstrap"
- 
+                error_log = ""
+
+            error_message = parse_error_log(error_log)
             transaction.status = "FAILED"
             transaction.end_time = datetime.utcnow()
             db.commit()
-            return JSONResponse(status_code=500, content={"message": error_message,"detail": error_log})
+            return JSONResponse(status_code=500, content={"message": error_message, "detail": error_log})
 
         if os.path.exists("pyspark_script.log"):
             os.remove("pyspark_script.log")
 
         transaction.end_time = datetime.utcnow()
         transaction.status = "SUCCESS"
-        
         db.commit()
 
         return {"message": "Hudi table bootstrapped successfully."}
@@ -152,7 +148,7 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
         transaction.status = "FAILED"
         db.commit()
         
-        return JSONResponse(status_code=500, content={"message": "Error while Running Spark Submit","detail": str(e)})
+        return JSONResponse(status_code=500, content={"message": "Error while Running Spark Submit", "detail": str(e)})
 
 @app.get("/bootstrap_history/")
 def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[str] = None, transaction_id: Optional[str] = None, db: Session = Depends(get_db)):
@@ -171,3 +167,105 @@ def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[s
     
     transactions = query.order_by(HudiTransaction.start_time.desc()).all()
     return transactions
+
+def parse_error_log(error_log: str) -> str:
+    """Parse error log for meaningful messages."""
+    if "Configuration Error:" in error_log:
+        return "Configuration Error: " + error_log.split("Configuration Error:")[1].strip().split("\n")[0]
+    elif "Permission Denied:" in error_log:
+        return "Access Permission Error: " + error_log.split("Permission Denied:")[1].strip().split("\n")[0]
+    elif "Unsupported file format:" in error_log:
+        return "Unsupported File Format: Only .parquet and .orc files are supported."
+    else:
+        return "An Unexpected error occurred during Hudi table Bootstrap"
+
+def check_hive_table(table_name: str) -> Optional[str]:
+    """Check if the specified Hive table exists and return its name."""
+    try:
+        command = f'hive -e "SHOW TABLES LIKE \'{table_name}\';"'
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"Hive command failed: {result.stderr}")
+
+        if table_name in result.stdout.splitlines():
+            return table_name
+        else:
+            return None
+    except Exception as e:
+        print("Error checking Hive table:", e)
+        return None
+
+def get_hdfs_location_from_hive_table(table_name: str) -> Optional[str]:
+    """Retrieve the HDFS location of the specified Hive table."""
+    try:
+        command = f'hive -e "DESCRIBE FORMATTED {table_name};"'
+        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"Hive command failed: {result.stderr}")
+
+        # Parse the output to find the location
+        for line in result.stdout.splitlines():
+            if "Location:" in line:
+                return line.split(":", 1)[1].strip()  # Return the HDFS location
+
+        return None  # Location not found
+    except Exception as e:
+        print("Error retrieving HDFS location from Hive table:", e)
+        return None
+
+def check_hdfs_partition(hdfs_path: str) -> bool:
+    """Check if the specified HDFS path is partitioned by looking for subdirectories."""
+    try:
+        # List the contents of the HDFS directory
+        result = subprocess.run(['hdfs', 'dfs', '-ls', hdfs_path], capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise Exception(f"HDFS command failed: {result.stderr}")
+
+        # Check for directories
+        has_partitions = False
+        for line in result.stdout.splitlines():
+            # Each line typically has a format of:
+            # permissions | number of replicas | owner | group | size | date | time | path
+            parts = line.split()
+            if len(parts) > 0:
+                # The path is always the last part
+                path = parts[-1]
+                # Check if it's a directory by looking for the presence of 'd' at the start of the permissions
+                if parts[0].startswith('d'):
+                    has_partitions = True
+                    break
+
+        return has_partitions  # Return True if any directories are found
+    except Exception as e:
+        print("Error checking HDFS partition:", e)
+        return False
+
+class PathOrTableCheck(BaseModel):
+    hudi_table_name: str
+
+@app.post("/check_path_or_table/")
+async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_db)):
+    """Check if the provided path is a HDFS path or a Hive table, and determine partitioning."""
+    path_or_table = data.hudi_table_name  # Assuming this is the table name
+
+    if path_or_table.startswith("hdfs://"):
+        is_partitioned = check_hdfs_partition(path_or_table)
+        return {"isPartitioned": is_partitioned, "tableName": None,"hdfsLocation": path_or_table}
+    else:
+        table_name = check_hive_table(path_or_table)
+        if table_name:
+            hdfs_location = get_hdfs_location_from_hive_table(table_name)
+            is_partitioned = check_hdfs_partition(hdfs_location) if hdfs_location else False
+            return {"isPartitioned": is_partitioned, "tableName": table_name,"hdfsLocation": hdfs_location}
+        else:
+            raise HTTPException(status_code=404, detail="Hive table not found.")
+
+
+# Run the FastAPI app using `uvicorn`
+# Uncomment the next line to run the server locally.
+# if __name__ == "__main__":
+#     import uvicorn
+#     uvicorn.run(app, host="0.0.0.0", port=8000)

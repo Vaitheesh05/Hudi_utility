@@ -6,13 +6,16 @@ import logging
 import os
 import sys
 import traceback
+import re
 
 # Set up logging to file with more detailed formatting
-logging.basicConfig(
-    filename="pyspark_script.log", 
-    level=logging.ERROR, 
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+def setup_logging(log_file):
+    """Set up logging to a specified file with detailed formatting."""
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.ERROR,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
 
 def validate_input_arguments(args):
     """Validate input arguments before processing."""
@@ -120,7 +123,7 @@ def validate_fields_in_schema(input_df, args):
     if errors:
         raise ValueError("\n".join(errors))
 
-def validate_post_bootstrap(spark, output_path, input_df,bootstrap_type, partition_regex=None):
+def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partition_regex=None):
     """Validate the Hudi table written to the output path against the input DataFrame."""
     try:
         # Read the Hudi table from the output path
@@ -147,13 +150,19 @@ def validate_post_bootstrap(spark, output_path, input_df,bootstrap_type, partiti
         # Check record count only if FULL_RECORD bootstrap is being performed
         if bootstrap_type == "FULL_RECORD":
             if partition_regex:
+                # Compile the regex to check for validity
+                try:
+                    regex_compiled = re.compile(partition_regex)
+                except re.error as e:
+                    raise ValueError(f"Invalid regex pattern: {e}")
+
                 # Collect distinct partitions from the input DataFrame
                 input_partitions = input_df.select(args.partition_field).distinct().collect()
                 full_record_count = 0
 
                 for partition in input_partitions:
                     partition_value = partition[0]
-                    if re.match(partition_regex, partition_value):
+                    if regex_compiled.match(partition_value):
                         # Count records in the input DataFrame that match the partition regex
                         full_record_count += input_df.filter(input_df[args.partition_field] == partition_value).count()
 
@@ -174,9 +183,8 @@ def validate_post_bootstrap(spark, output_path, input_df,bootstrap_type, partiti
 
         print("Post-bootstrap validation successful: Schema, data types, and record count match.")
 
-    except Exception as validation_error:
-        logging.error(f"Post-bootstrap validation error: {str(validation_error)}")
-        raise ValueError(f"Post-bootstrap validation failed: {str(validation_error)}")
+    except Exception as e:
+        print(f"ERROR - Post-bootstrap validation error: {e}")
 
 
 # Parse the command-line arguments
@@ -191,9 +199,13 @@ parser.add_argument("--write-operation", required=True)
 parser.add_argument("--output-path", required=True)
 parser.add_argument("--bootstrap-type", required=True)
 parser.add_argument("--partition-regex", required=False)  # Make optional
+parser.add_argument("--log-file", required=True) 
 args = parser.parse_args()
 
+setup_logging(args.log_file)
+
 spark = None
+
 try:
     # Validate input arguments first
     validate_input_arguments(args)

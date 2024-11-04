@@ -6,6 +6,8 @@ from typing import Optional
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime, timedelta
+import pydoop.hdfs as hdfs
+from pyhive import hive
 import json
 import os
 import re
@@ -202,27 +204,42 @@ async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_
     path_or_table = data.hudi_table_name  # Assuming this is the table name
 
     if path_or_table.startswith("hdfs://"):
+        # Validate HDFS path
         is_partitioned = check_hdfs_partition(path_or_table)
-        return {"isPartitioned": is_partitioned, "tableName": None, "hdfsLocation": path_or_table}
+        return {
+            "isPartitioned": is_partitioned,
+            "tableName": None,
+            "hdfsLocation": path_or_table
+        }
     else:
         table_name = check_hive_table(path_or_table)
         if table_name:
             hdfs_location = get_hdfs_location_from_hive_table(table_name)
-            is_partitioned = check_hdfs_partition(hdfs_location) if hdfs_location else False
-            return {"isPartitioned": is_partitioned, "tableName": table_name, "hdfsLocation": hdfs_location}
+            if hdfs_location:
+                is_partitioned = check_hdfs_partition(hdfs_location)
+                return {
+                    "isPartitioned": is_partitioned,
+                    "tableName": table_name,
+                    "hdfsLocation": hdfs_location
+                }
+            else:
+                raise HTTPException(status_code=404, detail="HDFS location for the Hive table not found.")
         else:
             raise HTTPException(status_code=404, detail="Hive table not found.")
+
+
+hive_host = 'localhost'  # Update with your Hive server host
+hive_port = 10000  # Default Hive port
+hive_conn = hive.Connection(host=hive_host, port=hive_port)
 
 def check_hive_table(table_name: str) -> Optional[str]:
     """Check if the specified Hive table exists and return its name."""
     try:
-        command = f'hive -e "SHOW TABLES LIKE \'{table_name}\';"'
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        with hive_conn.cursor() as cursor:
+            cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+            tables = cursor.fetchall()
 
-        if result.returncode != 0:
-            raise Exception(f"Hive command failed: {result.stderr}")
-
-        if table_name in result.stdout.splitlines():
+        if tables and table_name in [t[0] for t in tables]:
             return table_name
         else:
             return None
@@ -233,41 +250,78 @@ def check_hive_table(table_name: str) -> Optional[str]:
 def get_hdfs_location_from_hive_table(table_name: str) -> Optional[str]:
     """Retrieve the HDFS location of the specified Hive table."""
     try:
-        command = f'hive -e "DESCRIBE FORMATTED {table_name};"'
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
+        with hive_conn.cursor() as cursor:
+            cursor.execute(f"DESCRIBE FORMATTED {table_name}")
+            rows = cursor.fetchall()
+            print("Describe formatted output:", rows)  # Print the output for debugging
+            
+            for row in rows:
+                if isinstance(row, tuple) and row:
+                    # Check for 'Location:' first
+                    if "Location:" in row[0]:
+                        return row[1].strip()  # Return the HDFS location
+                    # Also check for 'path' under Storage Desc Params
+                    if "path" in row[0].lower():
+                        return row[1].strip()  # Return the HDFS path
 
-        if result.returncode != 0:
-            raise Exception(f"Hive command failed: {result.stderr}")
-
-        # Parse the output to find the location
-        for line in result.stdout.splitlines():
-            if "Location:" in line:
-                return line.split(":", 1)[1].strip()  # Return the HDFS location
-
+            print(f"No location found in DESCRIBE FORMATTED output for table {table_name}.")
         return None  # Location not found
     except Exception as e:
         print("Error retrieving HDFS location from Hive table:", e)
         return None
 
-def check_hdfs_partition(hdfs_path: str) -> bool:
-    """Check if the specified HDFS path is partitioned by looking for subdirectories."""
-    try:
-        result = subprocess.run(['hdfs', 'dfs', '-ls', hdfs_path], capture_output=True, text=True)
 
-        if result.returncode != 0:
-            raise Exception(f"HDFS command failed: {result.stderr}")
+
+def check_hdfs_partition(hdfs_path: str) -> bool:
+    """Check if the specified HDFS path is partitioned by looking for subdirectories and validate file formats."""
+    try:
+        # Check if the path exists
+        if not hdfs.path.isfile(hdfs_path) and not hdfs.path.isdir(hdfs_path):
+            raise HTTPException(status_code=404, detail=f"HDFS path does not exist: {hdfs_path}")
 
         has_partitions = False
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) > 0 and parts[0].startswith('d'):  # Check for directories
-                has_partitions = True
-                break
+        valid_formats = {'.parquet', '.orc'}
+        found_valid_files = False
+
+        def check_path(path: str):
+            nonlocal has_partitions, found_valid_files
+            # List contents of the HDFS directory
+            files = hdfs.ls(path)
+
+            for item in files:
+                item_path = hdfs.path.join(path, item)
+                if hdfs.path.isdir(item_path):
+                    has_partitions = True
+                    # Recursively check this partition for valid files
+                    check_path(item_path)
+                elif hdfs.path.isfile(item_path):
+                    # Check for valid file formats
+                    if any(item.endswith(fmt) for fmt in valid_formats):
+                        found_valid_files = True
+
+        # Start checking the initial path
+        check_path(hdfs_path)
+
+        # Determine final conditions
+        if not found_valid_files and not has_partitions:
+            raise HTTPException(status_code=404, detail=f"No files or directories found in the HDFS path: {hdfs_path}")
+        elif not found_valid_files:
+            raise HTTPException(status_code=404, detail=f"No valid files found in the HDFS path: {hdfs_path}")
 
         return has_partitions
+
+    except HTTPException as e:
+        raise e  # Re-raise HTTPException to maintain status code
     except Exception as e:
         print("Error checking HDFS partition:", e)
-        return False
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+
+
+
+
+
 
 
 

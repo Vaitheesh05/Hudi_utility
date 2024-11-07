@@ -114,7 +114,10 @@ def validate_fields_in_schema(input_df, args):
 
     # Validate partition field only if it's provided
     if args.partition_field and args.partition_field not in schema_fields:
-        errors.append(f"Partition field '{args.partition_field}' not found in schema.")
+        key_fields = args.partition_field.split(',')
+        missing_key_fields = [field for field in key_fields if field not in schema_fields]
+        if missing_key_fields:
+            errors.append(f"Partition field '{args.partition_field}' not found in schema.")
     
     if errors:
         raise ValueError("\n".join(errors))
@@ -286,4 +289,3 @@ finally:
     # Ensure Spark session is stopped
     if spark:
         spark.stop()
-

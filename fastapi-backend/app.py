@@ -7,12 +7,15 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime, timedelta
 import pydoop.hdfs as hdfs
+import pydoop
 from pyhive import hive
 import json
 import os
 import re
 import subprocess
 import threading
+from functools import lru_cache
+from typing import Set, Tuple
 
 # Database configuration
 DATABASE_URL = "postgresql://hudi_user:password@localhost/hudi_bootstrap_db"
@@ -90,7 +93,7 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
     spark_submit_command.append(f"--precombine-field={request.precombine_field}")
     if request.partition_field:
         spark_submit_command.append(f"--partition-field={request.partition_field}")
-
+    print(request.partition_field)
     spark_submit_command.append(f"--hudi-table-type={request.hudi_table_type}")
     spark_submit_command.append(f"--output-path={request.output_path}")
     spark_submit_command.append(f"--bootstrap-type={request.bootstrap_type}")
@@ -203,7 +206,7 @@ async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_
     """Check if the provided path is a HDFS path or a Hive table, and determine partitioning."""
     path_or_table = data.hudi_table_name  # Assuming this is the table name
 
-    if path_or_table.startswith("hdfs://"):
+    if path_or_table.startswith("hdfs://") or path_or_table.startswith("file://"):
         # Validate HDFS path
         is_partitioned = check_hdfs_partition(path_or_table)
         return {
@@ -247,74 +250,99 @@ def check_hive_table(table_name: str) -> Optional[str]:
         print("Error checking Hive table:", e)
         return None
 
-def get_hdfs_location_from_hive_table(table_name: str) -> Optional[str]:
-    """Retrieve the HDFS location of the specified Hive table."""
-    try:
-        with hive_conn.cursor() as cursor:
-            cursor.execute(f"DESCRIBE FORMATTED {table_name}")
-            rows = cursor.fetchall()
-            print("Describe formatted output:", rows)  # Print the output for debugging
-            
-            for row in rows:
-                if isinstance(row, tuple) and row:
-                    # Check for 'Location:' first
-                    if "Location:" in row[0]:
-                        return row[1].strip()  # Return the HDFS location
-                    # Also check for 'path' under Storage Desc Params
-                    if "path" in row[0].lower():
-                        return row[1].strip()  # Return the HDFS path
-
-            print(f"No location found in DESCRIBE FORMATTED output for table {table_name}.")
-        return None  # Location not found
-    except Exception as e:
-        print("Error retrieving HDFS location from Hive table:", e)
-        return None
-
-
 
 def check_hdfs_partition(hdfs_path: str) -> bool:
-    """Check if the specified HDFS path is partitioned by looking for subdirectories and validate file formats."""
-    try:
-        # Check if the path exists
-        if not hdfs.path.isfile(hdfs_path) and not hdfs.path.isdir(hdfs_path):
-            raise HTTPException(status_code=404, detail=f"HDFS path does not exist: {hdfs_path}")
+    """
+    Check if the specified HDFS path is partitioned by examining directory structure 
+    and validating file formats.
+
+    Args:
+        hdfs_path (str): The HDFS path to check
+
+    Returns:
+        bool: True if the path contains partitions, False otherwise
+
+    Raises:
+        HTTPException: With appropriate status codes for various error conditions
+    """
+    VALID_FORMATS: Set[str] = {'.parquet', '.orc'}
+    
+    @lru_cache(maxsize=128)
+    def is_valid_file(filename: str) -> bool:
+        """Cache frequently checked file extensions."""
+        return any(filename.endswith(fmt) for fmt in VALID_FORMATS)
+
+    def scan_directory(path: str) -> Tuple[bool, bool]:
+        """
+        Scan directory and return partition and valid file status.
+        
+        Returns:
+            Tuple[bool, bool]: (has_partitions, has_valid_files)
+        """
+        try:
+            contents = hdfs.ls(path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error reading HDFS directory {path}: {str(e)}"
+            )
 
         has_partitions = False
-        valid_formats = {'.parquet', '.orc'}
-        found_valid_files = False
+        has_valid_files = False
 
-        def check_path(path: str):
-            nonlocal has_partitions, found_valid_files
-            # List contents of the HDFS directory
-            files = hdfs.ls(path)
+        for item in contents:
+            item_path = hdfs.path.join(path, item)
+            
+            if hdfs.path.isdir(item_path):
+                sub_partitions, sub_files = scan_directory(item_path)
+                has_partitions = has_partitions or sub_partitions or True
+                has_valid_files = has_valid_files or sub_files
+                
+                # Early return optimization if we found both
+                if has_partitions and has_valid_files:
+                    return True, True
+                    
+            elif hdfs.path.isfile(item_path) and is_valid_file(item):
+                has_valid_files = True
+                
+                # Early return if we already found partitions
+                if has_partitions:
+                    return True, True
 
-            for item in files:
-                item_path = hdfs.path.join(path, item)
-                if hdfs.path.isdir(item_path):
-                    has_partitions = True
-                    # Recursively check this partition for valid files
-                    check_path(item_path)
-                elif hdfs.path.isfile(item_path):
-                    # Check for valid file formats
-                    if any(item.endswith(fmt) for fmt in valid_formats):
-                        found_valid_files = True
+        return has_partitions, has_valid_files
 
-        # Start checking the initial path
-        check_path(hdfs_path)
+    try:
+        # Validate path existence first
+        if not hdfs.path.exists(hdfs_path):
+            raise HTTPException(
+                status_code=404,
+                detail=f"HDFS path does not exist: {hdfs_path}"
+            )
 
-        # Determine final conditions
-        if not found_valid_files and not has_partitions:
-            raise HTTPException(status_code=404, detail=f"No files or directories found in the HDFS path: {hdfs_path}")
-        elif not found_valid_files:
-            raise HTTPException(status_code=404, detail=f"No valid files found in the HDFS path: {hdfs_path}")
+        # Scan directory structure
+        has_partitions, has_valid_files = scan_directory(hdfs_path)
+
+        # Validate results
+        if not has_valid_files and not has_partitions:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No valid files or directories found in: {hdfs_path}"
+            )
+        if not has_valid_files:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No valid files found in: {hdfs_path}"
+            )
 
         return has_partitions
 
-    except HTTPException as e:
-        raise e  # Re-raise HTTPException to maintain status code
+    except HTTPException:
+        raise
     except Exception as e:
-        print("Error checking HDFS partition:", e)
-        raise HTTPException(status_code=500, detail="Internal server error")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error: {str(e)}"
+        ) from e
 
 
 

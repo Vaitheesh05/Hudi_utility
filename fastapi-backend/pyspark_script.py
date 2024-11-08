@@ -122,68 +122,88 @@ def validate_fields_in_schema(input_df, args):
     if errors:
         raise ValueError("\n".join(errors))
 
-def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partition_regex=None):
+def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partition_field=None, partition_regex=None):
     """Validate the Hudi table written to the output path against the input DataFrame."""
     try:
         # Read the Hudi table from the output path
         hudi_df = spark.read.format("hudi").load(output_path)
-
-        # Get the schema of both DataFrames
-        input_schema = input_df.schema
-        hudi_schema = hudi_df.schema
-
-        # Extract user-defined columns from input schema
-        input_columns = {field.name: field.dataType for field in input_schema.fields}
-        hudi_columns = {field.name: field.dataType for field in hudi_schema.fields if not field.name.startswith("_")}
-
+        
+        # Extract schemas and columns
+        input_columns = {field.name: field.dataType for field in input_df.schema.fields}
+        hudi_columns = {field.name: field.dataType for field in hudi_df.schema.fields if not field.name.startswith("_")}
+        
         # Validate schema: Check if the input DataFrame columns exist in the Hudi table
+        missing_columns = [col for col in input_columns if col not in hudi_columns]
+        if missing_columns:
+            raise ValueError(f"Columns {', '.join(missing_columns)} are missing in Hudi table.")
+        
+        # Validate data types for matching columns
         for column_name, input_type in input_columns.items():
-            if column_name not in hudi_columns:
-                raise ValueError(f"Column '{column_name}' from input DataFrame is missing in Hudi table.")
-            
-            hudi_type = hudi_columns[column_name]
-            if input_type != hudi_type:
+            if column_name in hudi_columns and input_type != hudi_columns[column_name]:
                 raise ValueError(f"Data type mismatch for column '{column_name}': "
-                                 f"Input type '{input_type}' vs Hudi type '{hudi_type}'.")
-
-        # Check record count only if FULL_RECORD bootstrap is being performed
+                                 f"Input type '{input_type}' vs Hudi type '{hudi_columns[column_name]}'.")
+        
+        # Perform record count validation based on bootstrap type
         if bootstrap_type == "FULL_RECORD":
-            if partition_regex:
-                # Compile the regex to check for validity
+            # Validate partition regex if specified
+            if partition_field and partition_regex:
+                # Compile regex once
                 try:
                     regex_compiled = re.compile(partition_regex)
                 except re.error as e:
                     raise ValueError(f"Invalid regex pattern: {e}")
 
-                # Collect distinct partitions from the input DataFrame
-                input_partitions = input_df.select(args.partition_field).distinct().collect()
-                full_record_count = 0
-
+                # Get distinct partitions and check count for each partition
+                input_partitions = input_df.select(partition_field).distinct().collect()
+                
+                total_input_count = 0
+                total_hudi_count = 0
                 for partition in input_partitions:
                     partition_value = partition[0]
-                    if regex_compiled.match(partition_value):
-                        # Count records in the input DataFrame that match the partition regex
-                        full_record_count += input_df.filter(input_df[args.partition_field] == partition_value).count()
+                    
+                    # Match partition value with regex
+                    if regex_compiled.match(str(partition_value)):
+                        partition_input_df = input_df.filter(input_df[partition_field] == partition_value)
+                        partition_hudi_df = hudi_df.filter(hudi_df[partition_field] == partition_value)
+                        
+                        # Count records for this partition
+                        partition_input_count = partition_input_df.count()
+                        partition_hudi_count = partition_hudi_df.count()
+                        
+                        total_input_count += partition_input_count
+                        total_hudi_count += partition_hudi_count
+                        
+                        # Check for record count mismatch
+                        if partition_input_count != partition_hudi_count:
+                            raise ValueError(f"Record count mismatch for partition '{partition_value}': "
+                                             f"Input has {partition_input_count} records, Hudi table has {partition_hudi_count} records.")
 
-                # Now check against the Hudi table
-                hudi_record_count = hudi_df.count()
-
-                if full_record_count != hudi_record_count:
-                    raise ValueError(f"Record count mismatch for partitions matching regex: "
-                                     f"Input has {full_record_count} records, Hudi table has {hudi_record_count} records.")
+                # Compare total record counts for all matched partitions
+                logging.error(f"Total records in Input DataFrame: {total_input_count}")
+                logging.error(f"Total records in Hudi table: {total_hudi_count}")
+                if total_input_count != total_hudi_count:
+                    raise ValueError(f"Total record count mismatch: Input has {total_input_count} records, "
+                                     f"Hudi table has {total_hudi_count} records.")
+                
+                #logging.info(f"Full record count validation passed for partitions matching regex '{partition_regex}'.")
+            
             else:
-                # Check total record count if no regex is provided
+                # If no partition regex, compare total record counts
                 input_count = input_df.count()
                 hudi_count = hudi_df.count()
-
+                logging.error(f"Total records in Input DataFrame: {input_count}")
+                logging.error(f"Total records in Hudi table: {hudi_count}")
                 if input_count != hudi_count:
                     raise ValueError(f"Record count mismatch: Input has {input_count} records, "
                                      f"Hudi table has {hudi_count} records.")
+                
 
-        print("Post-bootstrap validation successful: Schema, data types, and record count match.")
-
+    
     except Exception as e:
-        print(f"ERROR - Post-bootstrap validation error: {e}")
+        # Raise exception so the main script can handle it
+        raise ValueError(f"ERROR - Post-bootstrap validation failed: {str(e)}")
+
+
 
 
 # Parse the command-line arguments
@@ -262,7 +282,10 @@ try:
         .mode("Overwrite") \
         .save(args.output_path)
 
-    validate_post_bootstrap(spark, args.output_path, input_df,args.bootstrap_type, args.partition_regex)
+    if args.partition_regex:
+        validate_post_bootstrap(spark, args.output_path, input_df, args.bootstrap_type, args.partition_field, args.partition_regex)
+    else:
+        validate_post_bootstrap(spark, args.output_path, input_df, args.bootstrap_type)
 
     # Log success message with more details
 

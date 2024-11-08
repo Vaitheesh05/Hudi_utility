@@ -7,7 +7,6 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime, timedelta
 import pydoop.hdfs as hdfs
-import pydoop
 from pyhive import hive
 import json
 import os
@@ -16,15 +15,25 @@ import subprocess
 import threading
 from functools import lru_cache
 from typing import Set, Tuple
+from dotenv import load_dotenv
 
-# Database configuration
-DATABASE_URL = "postgresql://hudi_user:password@localhost/hudi_bootstrap_db"
+# Load environment variables from .env file
+load_dotenv()
 
+# Database configuration from .env
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://hudi_user:password@localhost/hudi_bootstrap_db")
+
+# Hive and HDFS configuration from .env
+HIVE_HOST = os.getenv("HIVE_HOST", "localhost")
+HIVE_PORT = int(os.getenv("HIVE_PORT", 10000))
+HDFS_HOST = os.getenv("HDFS_HOST", "hdfs://localhost:9000")
+
+# Initialize the database engine and sessionmaker
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
 Base = declarative_base()
 
+# Model for Hudi Transactions
 class HudiTransaction(Base):
     __tablename__ = "hudi_transactions"
     
@@ -47,8 +56,10 @@ def get_db():
     finally:
         db.close()
 
+# FastAPI app initialization
 app = FastAPI()
 
+# CORS Middleware setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Consider specifying allowed origins for production
@@ -57,6 +68,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Pydantic model for request validation
 class HudiBootstrapRequest(BaseModel):
     data_file_path: str
     hudi_table_name: str
@@ -69,6 +81,7 @@ class HudiBootstrapRequest(BaseModel):
     bootstrap_type: str  # FULL_RECORD or METADATA_ONLY
     partition_regex: Optional[str] = None  # Optional regex for partitions
 
+# Run spark-submit in a separate thread to bootstrap the Hudi table
 def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction):
     current_directory = os.path.dirname(os.path.abspath(__file__))
     pyspark_script_path = os.path.join(current_directory, "pyspark_script.py")
@@ -77,7 +90,7 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
     # Build the spark-submit command
     spark_submit_command = [
         "spark-submit",
-        "--master", "local"
+        "--master", "local"  # Use SPARK_MASTER from .env if needed
     ]
     
     # Add Spark configurations
@@ -93,7 +106,6 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
     spark_submit_command.append(f"--precombine-field={request.precombine_field}")
     if request.partition_field:
         spark_submit_command.append(f"--partition-field={request.partition_field}")
-    print(request.partition_field)
     spark_submit_command.append(f"--hudi-table-type={request.hudi_table_type}")
     spark_submit_command.append(f"--output-path={request.output_path}")
     spark_submit_command.append(f"--bootstrap-type={request.bootstrap_type}")
@@ -129,6 +141,7 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
     transaction.end_time = datetime.utcnow()
     save_transaction(transaction)
 
+# Save the transaction in the database
 def save_transaction(transaction: HudiTransaction):
     try:
         with SessionLocal() as db:
@@ -138,6 +151,7 @@ def save_transaction(transaction: HudiTransaction):
     except Exception as e:
         print(f"Error saving transaction: {e}")
 
+# Endpoint to start the Hudi bootstrap process
 @app.post("/bootstrap_hudi/")
 def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db)):
     transaction_id = f"{request.hudi_table_name}-{int(datetime.utcnow().timestamp())}"
@@ -155,6 +169,7 @@ def bootstrap_hudi(request: HudiBootstrapRequest, db: Session = Depends(get_db))
 
     return {"transaction_id": transaction.transaction_id, "message": "Bootstrapping started."}
 
+# Endpoint to get bootstrap history
 @app.get("/bootstrap_history/")
 def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[str] = None, transaction_id: Optional[str] = None, db: Session = Depends(get_db)):
     query = db.query(HudiTransaction)
@@ -173,20 +188,31 @@ def get_bootstrap_history(start_date: Optional[str] = None, end_date: Optional[s
     transactions = query.order_by(HudiTransaction.start_time.desc()).all()
     return transactions
 
+# Endpoint to get bootstrap status for a given transaction
 @app.get("/bootstrap_status/{transaction_id}/")
 async def bootstrap_status(transaction_id: str, db: Session = Depends(get_db)):
+    # Query the transaction from the database
     transaction = db.query(HudiTransaction).filter(HudiTransaction.transaction_id == transaction_id).first()
+
     if not transaction:
         raise HTTPException(status_code=404, detail="Transaction not found.")
-    error_message=None
+
+    # Parse the error log for meaningful error messages
+    error_message = None
     if transaction.error_log:
-    	error_message = parse_error_log(transaction.error_log)
+        error_message = parse_error_log(transaction.error_log)
+    record_counts = extract_record_counts_from_log(transaction.error_log)
+
+    # Extract record counts from the error_log   
+
     return {
         "status": transaction.status,
         "error_log": transaction.error_log,
-        "error_message": error_message
+        "error_message": error_message,
+        "record_counts": record_counts
     }
 
+# Helper function to parse error logs
 def parse_error_log(error_log: str) -> str:
     """Parse error log for meaningful messages."""
     if "Configuration Error:" in error_log:
@@ -198,12 +224,39 @@ def parse_error_log(error_log: str) -> str:
     else:
         return "An Unexpected error occurred during Hudi table Bootstrap"
 
+def extract_record_counts_from_log(error_log: str) -> dict:
+    """Extract the record counts from the error_log."""
+    
+    if error_log is None:
+        # Optionally log a warning here or return a default value
+        return {"input_count": None, "hudi_count": None}
+
+    if not isinstance(error_log, str):
+        raise ValueError("Expected error_log to be a string, but got {0}".format(type(error_log)))
+
+    record_counts = {"input_count": None, "hudi_count": None}
+
+    # Regular expressions to extract the record counts from the error log
+    input_count_match = re.search(r"Total records in Input DataFrame: (\d+)", error_log)
+    hudi_count_match = re.search(r"Total records in Hudi table: (\d+)", error_log)
+
+    if input_count_match:
+        record_counts["input_count"] = int(input_count_match.group(1))
+
+    if hudi_count_match:
+        record_counts["hudi_count"] = int(hudi_count_match.group(1))
+
+    print(error_log)
+    print(record_counts)
+    return record_counts
+
+# Pydantic model to check path or table
 class PathOrTableCheck(BaseModel):
     hudi_table_name: str
 
+# Endpoint to check whether the provided path is an HDFS path or Hive table
 @app.post("/check_path_or_table/")
 async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_db)):
-    """Check if the provided path is a HDFS path or a Hive table, and determine partitioning."""
     path_or_table = data.hudi_table_name  # Assuming this is the table name
 
     if path_or_table.startswith("hdfs://") or path_or_table.startswith("file://"):
@@ -230,11 +283,10 @@ async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_
         else:
             raise HTTPException(status_code=404, detail="Hive table not found.")
 
+# Connect to Hive
+hive_conn = hive.Connection(host=HIVE_HOST, port=HIVE_PORT)
 
-hive_host = 'localhost'  # Update with your Hive server host
-hive_port = 10000  # Default Hive port
-hive_conn = hive.Connection(host=hive_host, port=hive_port)
-
+# Check if Hive table exists
 def check_hive_table(table_name: str) -> Optional[str]:
     """Check if the specified Hive table exists and return its name."""
     try:
@@ -250,21 +302,8 @@ def check_hive_table(table_name: str) -> Optional[str]:
         print("Error checking Hive table:", e)
         return None
 
-
+# Check if HDFS path is partitioned
 def check_hdfs_partition(hdfs_path: str) -> bool:
-    """
-    Check if the specified HDFS path is partitioned by examining directory structure 
-    and validating file formats.
-
-    Args:
-        hdfs_path (str): The HDFS path to check
-
-    Returns:
-        bool: True if the path contains partitions, False otherwise
-
-    Raises:
-        HTTPException: With appropriate status codes for various error conditions
-    """
     VALID_FORMATS: Set[str] = {'.parquet', '.orc'}
     
     @lru_cache(maxsize=128)
@@ -273,12 +312,6 @@ def check_hdfs_partition(hdfs_path: str) -> bool:
         return any(filename.endswith(fmt) for fmt in VALID_FORMATS)
 
     def scan_directory(path: str) -> Tuple[bool, bool]:
-        """
-        Scan directory and return partition and valid file status.
-        
-        Returns:
-            Tuple[bool, bool]: (has_partitions, has_valid_files)
-        """
         try:
             contents = hdfs.ls(path)
         except Exception as e:
@@ -298,31 +331,26 @@ def check_hdfs_partition(hdfs_path: str) -> bool:
                 has_partitions = has_partitions or sub_partitions or True
                 has_valid_files = has_valid_files or sub_files
                 
-                # Early return optimization if we found both
                 if has_partitions and has_valid_files:
                     return True, True
                     
             elif hdfs.path.isfile(item_path) and is_valid_file(item):
                 has_valid_files = True
                 
-                # Early return if we already found partitions
                 if has_partitions:
                     return True, True
 
         return has_partitions, has_valid_files
 
     try:
-        # Validate path existence first
         if not hdfs.path.exists(hdfs_path):
             raise HTTPException(
                 status_code=404,
                 detail=f"HDFS path does not exist: {hdfs_path}"
             )
 
-        # Scan directory structure
         has_partitions, has_valid_files = scan_directory(hdfs_path)
 
-        # Validate results
         if not has_valid_files and not has_partitions:
             raise HTTPException(
                 status_code=404,
@@ -343,17 +371,3 @@ def check_hdfs_partition(hdfs_path: str) -> bool:
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         ) from e
-
-
-
-
-
-
-
-
-
-
-# Uncomment the next line to run the server locally.
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)

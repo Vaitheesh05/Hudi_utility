@@ -119,6 +119,7 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
     process = subprocess.Popen(spark_submit_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
 
+    print(stderr.decode())
     app_id_match = re.search(r'local-\d{13}', stderr.decode())
     if app_id_match:
         app_id = app_id_match.group(0)

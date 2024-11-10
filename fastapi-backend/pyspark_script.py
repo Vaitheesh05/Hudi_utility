@@ -153,19 +153,29 @@ def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partit
                 except re.error as e:
                     raise ValueError(f"Invalid regex pattern: {e}")
 
-                # Get distinct partitions and check count for each partition
-                input_partitions = input_df.select(partition_field).distinct().collect()
+                # Split partition_field into individual columns (if composite)
+                partition_columns = [col.strip() for col in partition_field.split(',')]
+
+                # Get distinct combinations of partition column values
+                partition_values = input_df.select(*partition_columns).distinct().collect()
                 
                 total_input_count = 0
                 total_hudi_count = 0
-                for partition in input_partitions:
-                    partition_value = partition[0]
+                for partition in partition_values:
+                    # Create composite partition key by joining partition column values
+                    partition_value = "_".join(str(p) for p in partition)
                     
                     # Match partition value with regex
-                    if regex_compiled.match(str(partition_value)):
-                        partition_input_df = input_df.filter(input_df[partition_field] == partition_value)
-                        partition_hudi_df = hudi_df.filter(hudi_df[partition_field] == partition_value)
-                        
+                    if regex_compiled.match(partition_value):
+                        # Filter input and Hudi dataframes by this composite partition
+                        partition_input_df = input_df
+                        for col, val in zip(partition_columns, partition):
+                            partition_input_df = partition_input_df.filter(input_df[col] == val)
+
+                        partition_hudi_df = hudi_df
+                        for col, val in zip(partition_columns, partition):
+                            partition_hudi_df = partition_hudi_df.filter(hudi_df[col] == val)
+
                         # Count records for this partition
                         partition_input_count = partition_input_df.count()
                         partition_hudi_count = partition_hudi_df.count()
@@ -185,8 +195,6 @@ def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partit
                     raise ValueError(f"Total record count mismatch: Input has {total_input_count} records, "
                                      f"Hudi table has {total_hudi_count} records.")
                 
-                #logging.info(f"Full record count validation passed for partitions matching regex '{partition_regex}'.")
-            
             else:
                 # If no partition regex, compare total record counts
                 input_count = input_df.count()
@@ -196,13 +204,10 @@ def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partit
                 if input_count != hudi_count:
                     raise ValueError(f"Record count mismatch: Input has {input_count} records, "
                                      f"Hudi table has {hudi_count} records.")
-                
-
     
     except Exception as e:
         # Raise exception so the main script can handle it
         raise ValueError(f"ERROR - Post-bootstrap validation failed: {str(e)}")
-
 
 
 

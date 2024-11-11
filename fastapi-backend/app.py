@@ -372,3 +372,27 @@ def check_hdfs_partition(hdfs_path: str) -> bool:
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         ) from e
+
+
+def get_hdfs_location_from_hive_table(table_name: str) -> Optional[str]:
+    """Retrieve the HDFS location of the specified Hive table."""
+    try:
+        with hive_conn.cursor() as cursor:
+            cursor.execute(f"DESCRIBE FORMATTED {table_name}")
+            rows = cursor.fetchall()
+            
+            for row in rows:
+                if isinstance(row, tuple) and row:
+                    # Check for 'Location:' first
+                    if "Location:" in row[0]:
+                        return row[1].strip()  # Return the HDFS location
+                    # Also check for 'path' under Storage Desc Params
+                    if "path" in row[0].lower():
+                        return row[1].strip()  # Return the HDFS path
+            print(f"No location found in DESCRIBE FORMATTED output for table {table_name}.")
+        return None  # Location not found
+    except Exception as e:
+        print("Error retrieving HDFS location from Hive table:", e)
+        return None
+
+

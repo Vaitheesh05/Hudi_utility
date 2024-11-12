@@ -26,7 +26,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://hudi_user:password@localh
 # Hive and HDFS configuration from .env
 HIVE_HOST = os.getenv("HIVE_HOST", "localhost")
 HIVE_PORT = int(os.getenv("HIVE_PORT", 10000))
-HDFS_HOST = os.getenv("HDFS_HOST", "hdfs://localhost:9000")
 
 # Initialize the database engine and sessionmaker
 engine = create_engine(DATABASE_URL)
@@ -119,7 +118,6 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
     process = subprocess.Popen(spark_submit_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     stdout, stderr = process.communicate()
 
-    print(stderr.decode())
     app_id_match = re.search(r'local-\d{13}', stderr.decode())
     if app_id_match:
         app_id = app_id_match.group(0)
@@ -208,7 +206,7 @@ async def bootstrap_status(transaction_id: str, db: Session = Depends(get_db)):
 
     return {
         "status": transaction.status,
-        "error_log": transaction.error_log,
+        "error_log": transaction.errorprint_log,
         "error_message": error_message,
         "record_counts": record_counts
     }
@@ -247,8 +245,6 @@ def extract_record_counts_from_log(error_log: str) -> dict:
     if hudi_count_match:
         record_counts["hudi_count"] = int(hudi_count_match.group(1))
 
-    print(error_log)
-    print(record_counts)
     return record_counts
 
 # Pydantic model to check path or table

@@ -298,20 +298,17 @@ except ValueError as ve:
     # Detailed logging for validation and configuration errors
     error_message = f"Configuration Error: {str(ve)}"
     logging.error(error_message)
-    print(error_message)
     sys.exit(1)
 except PermissionError as pe:
     # Specific handling for permission-related errors
     error_message = f"Permission Denied: {str(pe)}"
     logging.error(error_message)
-    print(error_message)
     sys.exit(1)
 except Exception as e:
     # Comprehensive error logging for unexpected errors
     error_message = f"Unexpected Error: {str(e)}"
     logging.error(error_message)
     logging.error(f"Full Traceback: {traceback.format_exc()}")
-    print(error_message)
     sys.exit(1)
 finally:
     # Ensure Spark session is stopped

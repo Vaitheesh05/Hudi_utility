@@ -206,7 +206,7 @@ async def bootstrap_status(transaction_id: str, db: Session = Depends(get_db)):
 
     return {
         "status": transaction.status,
-        "error_log": transaction.errorprint_log,
+        "error_log": transaction.error_log,
         "error_message": error_message,
         "record_counts": record_counts
     }

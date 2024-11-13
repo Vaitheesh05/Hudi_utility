@@ -14,7 +14,7 @@ import re
 import subprocess
 import threading
 from functools import lru_cache
-from typing import Set, Tuple
+from typing import Set, Tuple, List
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -66,6 +66,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+TRANSACTION_TIMEOUT_MINUTES = 60
+
+# Runaway transaction error message
+RUNAWAY_ERROR_MESSAGE = "Transaction timeout or runaway process."
+
+# Add an event handler for startup to check and update runaway transactions
+@app.on_event("startup")
+async def check_runaway_transactions():
+    try:
+        # Get the current time
+        current_time = datetime.utcnow()
+
+        # Open a database session
+        with SessionLocal() as db:
+            # Query for all pending transactions that have been running for too long
+            pending_transactions = db.query(HudiTransaction).filter(
+                HudiTransaction.status == "PENDING",
+                HudiTransaction.start_time <= current_time - timedelta(minutes=TRANSACTION_TIMEOUT_MINUTES)
+            ).all()
+
+            # Loop through the pending transactions and update their status to 'FAILED'
+            for transaction in pending_transactions:
+                transaction.status = "FAILED"
+                transaction.error_log = RUNAWAY_ERROR_MESSAGE
+
+                # Save the transaction status update in the database
+                db.add(transaction)
+            db.commit()  # Commit all changes at once
+
+        # Log the action
+        print(f"Updated {len(pending_transactions)} runaway transactions to FAILED.")
+
+    except Exception as e:
+        print(f"Error during startup processing runaway transactions: {str(e)}")
+
 
 # Pydantic model for request validation
 class HudiBootstrapRequest(BaseModel):
@@ -251,27 +287,34 @@ def extract_record_counts_from_log(error_log: str) -> dict:
 class PathOrTableCheck(BaseModel):
     hudi_table_name: str
 
+hive_conn = hive.Connection(host=HIVE_HOST, port=HIVE_PORT)
+
 # Endpoint to check whether the provided path is an HDFS path or Hive table
 @app.post("/check_path_or_table/")
 async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_db)):
     path_or_table = data.hudi_table_name  # Assuming this is the table name
 
     if path_or_table.startswith("hdfs://") or path_or_table.startswith("file://"):
-        # Validate HDFS path
-        is_partitioned = check_hdfs_partition(path_or_table)
+        # Validate HDFS path and get partition fields
+        is_partitioned, partition_fields = check_hdfs_partition(path_or_table)
+        print(partition_fields)
         return {
             "isPartitioned": is_partitioned,
+            "partitionFields": partition_fields,  # Return partition fields as a string
             "tableName": None,
             "hdfsLocation": path_or_table
         }
     else:
+        # Check if it's a Hive table and extract partition fields
         table_name = check_hive_table(path_or_table)
         if table_name:
             hdfs_location = get_hdfs_location_from_hive_table(table_name)
             if hdfs_location:
-                is_partitioned = check_hdfs_partition(hdfs_location)
+                is_partitioned, partition_fields = check_hdfs_partition(hdfs_location)
+                print(partition_fields)
                 return {
                     "isPartitioned": is_partitioned,
+                    "partitionFields": partition_fields,  # Return partition fields as a string
                     "tableName": table_name,
                     "hdfsLocation": hdfs_location
                 }
@@ -280,10 +323,7 @@ async def check_path_or_table(data: PathOrTableCheck, db: Session = Depends(get_
         else:
             raise HTTPException(status_code=404, detail="Hive table not found.")
 
-# Connect to Hive
-hive_conn = hive.Connection(host=HIVE_HOST, port=HIVE_PORT)
 
-# Check if Hive table exists
 def check_hive_table(table_name: str) -> Optional[str]:
     """Check if the specified Hive table exists and return its name."""
     try:
@@ -299,16 +339,80 @@ def check_hive_table(table_name: str) -> Optional[str]:
         print("Error checking Hive table:", e)
         return None
 
-# Check if HDFS path is partitioned
-def check_hdfs_partition(hdfs_path: str) -> bool:
-    VALID_FORMATS: Set[str] = {'.parquet', '.orc'}
-    
+def get_partition_fields_from_hive_table(table_name: str) -> Optional[str]:
+    """Get unique partition fields from a Hive table, handling multi-level partitions."""
+    try:
+        with hive_conn.cursor() as cursor:
+            cursor.execute(f"DESCRIBE FORMATTED {table_name}")
+            rows = cursor.fetchall()
+
+        # Flag to detect when we're inside the partition information section
+        partition_found = False
+        partition_fields = set()  # Using a set to ensure uniqueness
+
+        # Process each row
+        for row in rows:
+            if isinstance(row, tuple) and row:
+                row_content = row[0].strip()  # Extract the partition field from the row
+
+                # Start extracting partition fields after encountering 'Partition Information'
+                if "Partition Information" in row_content:
+                    partition_found = True
+                elif partition_found:
+                    # Stop extracting when an empty row is found (end of partition section)
+                    if not row_content:
+                        break
+                    # Otherwise, process the row content if it's a partition field
+                    if not row_content.startswith("#") and row_content:
+                        partition_fields.add(row_content.split()[0])  # Split to get the column name
+
+        # After partition fields are found, clean them up
+        final_partition_fields = set()
+
+        for field in partition_fields:
+            # Clean up partition field name to avoid duplicates and remove 'value' part if present
+            match = re.match(r"([A-Za-z0-9_]+)", field)  # Match just the column name
+            if match:
+                final_partition_fields.add(match.group(1))  # Only store the column name
+
+        # If partition fields are found, return them as a comma-separated string
+        if final_partition_fields:
+            #return ", ".join(sorted(final_partition_fields))  # Sort for consistency
+            return final_partition_fields
+        else:
+            return None
+
+    except Exception as e:
+        print(f"Error retrieving partition fields for Hive table {table_name}: {e}")
+        return None
+
+def check_hdfs_partition(hdfs_path: str) -> Tuple[bool, str]:
+    """Check if the given HDFS path contains partitioned data and return partition fields."""
+    VALID_FORMATS = {'.parquet', '.orc'}
+
     @lru_cache(maxsize=128)
     def is_valid_file(filename: str) -> bool:
         """Cache frequently checked file extensions."""
         return any(filename.endswith(fmt) for fmt in VALID_FORMATS)
 
-    def scan_directory(path: str) -> Tuple[bool, bool]:
+    def extract_partition_fields_from_path(path: str) -> List[str]:
+        """Extract partition fields from a relative directory path. Expecting directories like year=2020/month=01/day=01."""
+        partition_fields = []
+        # Match patterns like year=2020, month=01, day=25
+        pattern = r"([^/]+)=([^/]+)"
+        matches = re.findall(pattern, path)
+        for key, value in matches:
+            if key not in partition_fields:  # Add unique partition fields while maintaining order
+                partition_fields.append(key)
+        return partition_fields
+
+    def is_partition_directory(path: str) -> bool:
+        """Check if the directory name matches a partition format (e.g., year=2020/month=01/day=01)."""
+        # Match partition format like 'year=2020', 'month=01', 'day=01'
+        return bool(re.match(r"^[^/]+=[^/]+$", path))
+
+    def scan_directory(path: str) -> Tuple[bool, List[str]]:
+        """Recursively scan a directory and collect partition fields from subdirectories."""
         try:
             contents = hdfs.ls(path)
         except Exception as e:
@@ -318,48 +422,63 @@ def check_hdfs_partition(hdfs_path: str) -> bool:
             )
 
         has_partitions = False
-        has_valid_files = False
+        partition_fields = []  # List to maintain the order of partition fields
 
+        # Track if we find partitioned directories (e.g., 'year=2020/month=01')
         for item in contents:
             item_path = hdfs.path.join(path, item)
-            
-            if hdfs.path.isdir(item_path):
-                sub_partitions, sub_files = scan_directory(item_path)
-                has_partitions = has_partitions or sub_partitions or True
-                has_valid_files = has_valid_files or sub_files
-                
-                if has_partitions and has_valid_files:
-                    return True, True
-                    
-            elif hdfs.path.isfile(item_path) and is_valid_file(item):
-                has_valid_files = True
-                
-                if has_partitions:
-                    return True, True
 
-        return has_partitions, has_valid_files
+            # Get the relative path by removing the base hdfs_path from item_path
+            relative_path = item_path[len(hdfs_path):].lstrip('/')
+
+            if hdfs.path.isdir(item_path):
+                # Check if it's a partition directory by examining its structure
+                if is_partition_directory(relative_path):
+                    partition_field = extract_partition_fields_from_path(relative_path)
+                    if partition_field:
+                        has_partitions = True
+                        # Ensure the partition field is added in the right order
+                        for field in partition_field:
+                            if field not in partition_fields:
+                                partition_fields.append(field)
+
+                # Recursively scan subdirectories to find partition fields
+                sub_partitions, sub_partition_fields = scan_directory(item_path)
+                has_partitions = has_partitions or sub_partitions
+                # Add the partition fields found in subdirectories while maintaining order
+                for field in sub_partition_fields:
+                    if field not in partition_fields:
+                        partition_fields.append(field)
+
+            elif hdfs.path.isfile(item_path) and is_valid_file(item):
+                # If it's a valid file and part of a partitioned structure, extract partition fields
+                partition_field = extract_partition_fields_from_path(relative_path)
+                if partition_field:
+                    has_partitions = True
+                    # Ensure the partition field is added in the right order
+                    for field in partition_field:
+                        if field not in partition_fields:
+                            partition_fields.append(field)
+
+        return has_partitions, partition_fields
 
     try:
+        # Check if the given path exists
         if not hdfs.path.exists(hdfs_path):
             raise HTTPException(
                 status_code=404,
                 detail=f"HDFS path does not exist: {hdfs_path}"
             )
 
-        has_partitions, has_valid_files = scan_directory(hdfs_path)
+        # Scan the directory for partitions inside subdirectories
+        has_partitions, partition_fields = scan_directory(hdfs_path)
 
-        if not has_valid_files and not has_partitions:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No valid files or directories found in: {hdfs_path}"
-            )
-        if not has_valid_files:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No valid files found in: {hdfs_path}"
-            )
-
-        return has_partitions
+        # If partitions were found, return them as a comma-separated string
+        if has_partitions:
+            # Ensure partitions are only returned if there are multiple partition levels
+            return True, ",".join(partition_fields)
+        else:
+            return False, None  # No partitions found, return None for partition fields
 
     except HTTPException:
         raise
@@ -368,6 +487,15 @@ def check_hdfs_partition(hdfs_path: str) -> bool:
             status_code=500,
             detail=f"Internal server error: {str(e)}"
         ) from e
+
+
+
+def extract_partition_field_from_path(path: str) -> Optional[str]:
+    """Extract partition field from an HDFS path if available."""
+    match = re.match(r'.*/([^/]+)=([^/]+)(?:/.*)?', path)
+    if match:
+        return match.group(1)  # The partition field name
+    return None
 
 
 def get_hdfs_location_from_hive_table(table_name: str) -> Optional[str]:

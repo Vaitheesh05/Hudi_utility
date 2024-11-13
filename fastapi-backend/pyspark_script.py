@@ -8,14 +8,35 @@ import sys
 import traceback
 import re
 
-# Set up logging to file with more detailed formatting
 def setup_logging(log_file):
-    """Set up logging to a specified file with detailed formatting."""
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.ERROR,
-        format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    """Set up logging to a specified file with detailed formatting for INFO and ERROR levels."""
+    # Create a logger
+    logger = logging.getLogger()
+    
+    # Set the minimum level to INFO to capture both INFO and ERROR messages
+    logger.setLevel(logging.INFO)
+    
+    # Create a file handler to log messages to a file
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(logging.INFO)  # Will capture INFO and ERROR messages
+    
+    # Create a console handler to log ERROR messages to the console
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.ERROR)  # Will capture only ERROR messages for console output
+    
+    # Create a formatter with detailed message format
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s - %(funcName)s")
+    
+    # Apply the formatter to the handlers
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    # Optionally log an info message indicating logging is set up
+    logger.info("Logging setup complete")
 
 def validate_input_arguments(args):
     """Validate input arguments before processing."""
@@ -189,8 +210,8 @@ def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partit
                                              f"Input has {partition_input_count} records, Hudi table has {partition_hudi_count} records.")
 
                 # Compare total record counts for all matched partitions
-                logging.error(f"Total records in Input DataFrame: {total_input_count}")
-                logging.error(f"Total records in Hudi table: {total_hudi_count}")
+                logging.info(f"Total records in Input DataFrame: {total_input_count}")
+                logging.info(f"Total records in Hudi table: {total_hudi_count}")
                 if total_input_count != total_hudi_count:
                     raise ValueError(f"Total record count mismatch: Input has {total_input_count} records, "
                                      f"Hudi table has {total_hudi_count} records.")
@@ -199,8 +220,8 @@ def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partit
                 # If no partition regex, compare total record counts
                 input_count = input_df.count()
                 hudi_count = hudi_df.count()
-                logging.error(f"Total records in Input DataFrame: {input_count}")
-                logging.error(f"Total records in Hudi table: {hudi_count}")
+                logging.info(f"Total records in Input DataFrame: {input_count}")
+                logging.info(f"Total records in Hudi table: {hudi_count}")
                 if input_count != hudi_count:
                     raise ValueError(f"Record count mismatch: Input has {input_count} records, "
                                      f"Hudi table has {hudi_count} records.")
@@ -209,6 +230,110 @@ def validate_post_bootstrap(spark, output_path, input_df, bootstrap_type, partit
         # Raise exception so the main script can handle it
         raise ValueError(f"ERROR - Post-bootstrap validation failed: {str(e)}")
 
+def get_existing_partitions(hdfs_path):
+    """Check existing partitions in the output Hudi table."""
+    try:
+        if not hdfs.path.exists(hdfs_path):
+            return None
+        
+        # Get list of existing partitions
+        partitions = hdfs.ls(hdfs_path)
+        existing_partitions = [
+            p.split('/')[-1]  # Extract partition value (e.g., '2024-10-06') from full path
+            for p in partitions if hdfs.path.isdir(p) and p != '.hoodie'
+        ]
+        logging.info(f"Found Partitions : {existing_partitions}")
+        return existing_partitions
+    except Exception as e:
+        logging.error(f"Error fetching existing partitions: {traceback.format_exc()}")
+        raise ValueError(f"Error fetching partitions from {hdfs_path}: {str(e)}")
+
+
+def is_partition_complete(input_df, hudi_df, partition_value, partition_field):
+    """Check if a partition is complete by comparing record counts."""
+    try:
+        # Filter input DataFrame for the partition value
+        input_partition_df = input_df.filter(input_df[partition_field] == partition_value)
+        input_partition_count = input_partition_df.count()
+
+        # Filter Hudi DataFrame for the partition value
+        hudi_partition_df = hudi_df.filter(hudi_df[partition_field] == partition_value)
+        hudi_partition_count = hudi_partition_df.count()
+
+        # Compare the counts
+        if input_partition_count != hudi_partition_count:
+            logging.info(f"Partition {partition_value} is incomplete. "
+                         f"Input records: {input_partition_count}, Hudi records: {hudi_partition_count}")
+            return False  # Partition is incomplete
+        else:
+            logging.info(f"Partition {partition_value} is complete. "
+                         f"Input records: {input_partition_count}, Hudi records: {hudi_partition_count}")
+            return True  # Partition is complete
+
+    except Exception as e:
+        logging.error(f"Error checking partition completeness for {partition_value}: {str(e)}")
+        return False  # In case of error, consider the partition incomplete
+
+
+def get_missing_and_incomplete_partitions(input_df, hudi_df, existing_partitions, partition_field):
+    """Identify missing and incomplete partitions based on record counts."""
+    missing_partitions = []
+    incomplete_partitions = []
+
+    # Get distinct partition values from the input DataFrame
+    partition_column_values = input_df.select(partition_field).distinct().collect()
+
+    # Create a set of partition values from the input data (converting datetime to string)
+    partition_values_set = set(str(partition_value[partition_field]) for partition_value in partition_column_values)
+
+    for partition_value in partition_values_set:
+        # Check if partition exists in the Hudi table (compare partition values)
+        if partition_value not in existing_partitions:
+            missing_partitions.append(partition_value)
+        else:
+            # Check if the partition is complete by comparing record counts
+            if not is_partition_complete(input_df, hudi_df, partition_value, partition_field):
+                incomplete_partitions.append(partition_value)
+    logging.info(f"Missing Partitions : {missing_partitions}")
+    logging.info(f"Incomplete Partitions : {incomplete_partitions}")
+    return missing_partitions, incomplete_partitions
+
+def write_missing_and_incomplete_partitions(input_df, missing_partitions, incomplete_partitions, write_config, partition_field, output_path):
+    """Write the missing and incomplete partitions to Hudi."""
+    partitions_to_write = set(missing_partitions + incomplete_partitions)
+    partitions_to_write_str = [str(p) for p in partitions_to_write]
+    
+    if partitions_to_write:
+        # Filter the input DataFrame to include only records from missing or incomplete partitions
+        df_to_write = input_df.filter(input_df[partition_field].isin(partitions_to_write))
+        
+        # Ensure no duplicates on key-field before writing
+        key_fields = [field.strip() for field in args.key_field.split(',')]
+
+        # Apply dropDuplicates on the list of key fields
+        df_to_write = df_to_write.dropDuplicates(key_fields)
+        
+        try:
+            # Write the missing or incomplete partitions to Hudi with Append mode
+            df_to_write.write.format("hudi") \
+                .options(**write_config) \
+                .mode("Append") \
+                .save(output_path)
+            
+            logging.info(f"Successfully wrote missing and incomplete partitions: {', '.join(partitions_to_write_str)}")
+        except Exception as write_error:
+            logging.error(f"Error while writing missing and incomplete partitions: {str(write_error)}")
+            raise ValueError(f"Failed to write missing or incomplete partitions: {str(write_error)}")
+
+
+def write_full_data(input_df, write_config):
+    """Write the entire DataFrame if no partitions exist."""
+    logging.info("No existing partitions found. Writing the full DataFrame.")
+    input_df.write.format("hudi") \
+        .options(**write_config) \
+        .mode("Overwrite") \
+        .save(args.output_path)
+    logging.info("Full DataFrame written to Hudi.")
 
 
 # Parse the command-line arguments
@@ -265,6 +390,16 @@ try:
     if record_count == 0:
         raise ValueError("Input dataframe is empty. No records to process.")
 
+    # Check if output path exists and fetch partitions accordingly
+    if hdfs.path.exists(args.output_path):
+        # Read the Hudi DataFrame if output path exists
+        hudi_df = spark.read.format("hudi").load(args.output_path)
+        existing_partitions = get_existing_partitions(args.output_path)
+    else:
+        # Handle case when output path doesn't exist
+        hudi_df = None
+        existing_partitions = None
+
     # Write to Hudi with comprehensive configuration
     write_config = {
         "hoodie.datasource.write.table.type": args.hudi_table_type,
@@ -272,7 +407,6 @@ try:
         "hoodie.datasource.write.precombine.field": args.precombine_field,
         "hoodie.table.name": args.hudi_table_name,
         "hoodie.schema.on.read.enable": "true",
-        "hoodie.upsert.shuffle.parallelism": 2,
         "hoodie.bootstrap.mode": args.bootstrap_type
     }
 
@@ -282,17 +416,26 @@ try:
     if args.partition_regex:
         write_config["hoodie.bootstrap.partition.regex"] = args.partition_regex
 
-    input_df.write.format("hudi") \
-        .options(**write_config) \
-        .mode("Overwrite") \
-        .save(args.output_path)
+    if not existing_partitions:
+        # If there are no existing partitions, write the full DataFrame
+        write_full_data(input_df, write_config)
+    else:
+        # Identify missing partitions
+        missing_partitions, incomplete_partitions = get_missing_and_incomplete_partitions(input_df, hudi_df, existing_partitions, args.partition_field)
+
+        if missing_partitions or incomplete_partitions:
+        # Write the missing and incomplete partitions
+            write_missing_and_incomplete_partitions(input_df, missing_partitions, incomplete_partitions, write_config, args.partition_field, args.output_path)
+        else:
+        # If no partitions need writing, log and exit
+            logging.info("No missing or incomplete partitions found. No data written.")
+    
+    logging.info("Hudi bootstrap process completed successfully.")
 
     if args.partition_regex:
         validate_post_bootstrap(spark, args.output_path, input_df, args.bootstrap_type, args.partition_field, args.partition_regex)
     else:
         validate_post_bootstrap(spark, args.output_path, input_df, args.bootstrap_type)
-
-    # Log success message with more details
 
 except ValueError as ve:
     # Detailed logging for validation and configuration errors
@@ -314,3 +457,4 @@ finally:
     # Ensure Spark session is stopped
     if spark:
         spark.stop()
+

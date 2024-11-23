@@ -5,7 +5,7 @@ This project consists of a **FastAPI** backend and a **React** frontend. The Fas
 
 ## Overview
 
-The application allows users to bootstrap Hudi tables using data from various file formats (Parquet and ORC), track the history of bootstrap transactions, and check the status of ongoing transactions. It also includes features to validate whether a given path is an HDFS directory or Hive table.
+The application allows users to bootstrap Hudi tables using data from various file formats (Parquet and ORC), track the history of bootstrap transactions, and check the status of ongoing transactions. It also includes features to validate whether a given path is an HDFS directory or Hive table. Additionally, the backend exposes a **WebSocket** endpoint to stream real-time progress updates for bootstrap transactions.
 
 ## Directory Structure
 
@@ -13,7 +13,7 @@ The application allows users to bootstrap Hudi tables using data from various fi
 .
 ├── fastapi-backend
 │   ├── app.py                # FastAPI application
-│   └── pyspark_script.py     # PySpark script for data processing
+│   └── pyspark_script.py     # PySpark script for data processing     
 └── react-frontend
     ├── src                  # React application source files
     │   ├── App.js           # Main application component
@@ -182,19 +182,53 @@ The React application should now be running at `http://localhost:3000`.
 
 - **Description**: This endpoint validates whether the provided input is an HDFS path or a Hive table. If it's an HDFS path, it checks whether it's partitioned. If it's a Hive table, it returns the corresponding HDFS location and partition information.
 
+#### **WebSocket** `/ws/`
+- **Description**: This WebSocket endpoint allows users to subscribe to real-time progress updates for a bootstrap transaction.
+- **Request Body**:
+    - **JSON Object** with the `transaction_id` to track the progress of a specific bootstrap transaction.
+    
+    Example message to send upon connecting:
+    ```json
+    {
+      "transaction_id": "your_transaction_id_here"
+    }
+    ```
+
+- **Response**:
+    The WebSocket will stream real-time updates as the bootstrap operation progresses. These updates may include information such as:
+    - **Transaction status** (e.g., `PENDING`, `SUCCESS`, `FAILED`)
+    - **Error messages** (if applicable)
+    - **Record counts** for the bootstrap process (e.g., number of input records, number of records written to Hudi)
+    
+    Example of a response:
+    ```json
+    {
+      "status": "PENDING",
+      "error_message": "",
+      "record_counts": {
+        "input_count": None,
+        "hudi_count": None
+      }
+    }
+    ```
+
+- **Description**: This endpoint allows clients to receive real-time updates on the status of a bootstrap transaction. As the bootstrap operation progresses, status updates are pushed to the connected clients via the WebSocket.
+
 ### React Frontend
 
 The React frontend allows users to:
 
 - **Bootstrap a New Hudi Table**: Users can submit a form with the necessary details to initiate a Hudi bootstrap operation.
 - **View Bootstrap History**: Users can view a history table that shows previous bootstrap operations, including their status and error logs.
+- **Real-time Progress Updates**: Users can subscribe to WebSocket updates to view real-time progress for ongoing bootstrap operations.
 
 #### Components Overview
 
 - **App.js**: Main application component that manages routing and layout.
 - **BootstrapPage.js**: Component for handling the bootstrap process, including the form submission to the `/bootstrap_hudi/` endpoint.
 - **HistoryTable.js**: Component for displaying the history of bootstrap transactions. It interacts with the `/bootstrap_history/` endpoint to fetch transaction details.
-- **theme.js**: Custom Material-UI theme configuration to style the React app.
+- **Theme.js**: Custom Material-UI theme configuration to style the React app.
+- **WebSocket Component**: A component that connects to the `/ws/` WebSocket endpoint to receive real-time progress updates.
 
 ### FastAPI Application (`app.py`)
 
@@ -203,7 +237,8 @@ The FastAPI backend contains endpoints for managing the bootstrap process, inclu
 - A `/bootstrap_hudi/` endpoint to initiate bootstrapping via Spark.
 - A `/bootstrap_history/` endpoint to retrieve bootstrap history from the PostgreSQL database.
 - A `/bootstrap_status/{transaction_id}/` endpoint to check the status of a specific bootstrap transaction.
-- A `/check_path_or_table/` endpoint to validate if a given path is an HDFS directory or a Hive table.
+- A `/check_path_or_table/ endpoint to validate if a given path is an HDFS directory or a Hive table.
+- A WebSocket `/ws/` endpoint to stream real-time updates of bootstrap transaction status.
 
 The backend also uses **SQLAlchemy** for managing the database and **PySpark** for running Spark jobs in the background.
 
@@ -217,10 +252,12 @@ The backend also uses **SQLAlchemy** for managing the database and **PySpark** f
 
 3. **Database Connection Issues**: Verify the PostgreSQL database is running, and the credentials in `.env` match the database configuration.
 
+4. **WebSocket Connection Issues**: Ensure that the WebSocket endpoint is correctly implemented and that the `transaction_id` provided is valid. You can check the WebSocket logs in the FastAPI server to troubleshoot connection issues.
+
 ---
 
 ### Conclusion
 
-This Hudi Bootstrap Application allows users to efficiently bootstrap Hudi tables using the FastAPI backend and provides an intuitive user interface via React. It supports querying transaction history, checking bootstrap status, and validating HDFS or Hive paths/tables. The architecture is modular and extensible, allowing for future improvements and additional features.
+This Hudi Bootstrap Application allows users to efficiently bootstrap Hudi tables using the FastAPI backend and provides an intuitive user interface via React. It supports querying transaction history, checking bootstrap status, validating HDFS or Hive paths/tables, and streaming real-time progress updates via WebSocket. The architecture is modular and extensible, allowing for future improvements and additional features.
 
 

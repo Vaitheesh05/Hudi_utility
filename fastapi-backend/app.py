@@ -120,6 +120,7 @@ class HudiBootstrapRequest(BaseModel):
     spark_config: Optional[dict] = None  # Optional spark configurations
     bootstrap_type: str  # FULL_RECORD or METADATA_ONLY
     partition_regex: Optional[str] = None  # Optional regex for partitions
+    resume: Optional[bool] = False
 
 # Run spark-submit in a separate thread to bootstrap the Hudi table
 def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction):
@@ -154,6 +155,7 @@ def run_spark_submit(request: HudiBootstrapRequest, transaction: HudiTransaction
         spark_submit_command.append(f"--partition-regex={request.partition_regex}")
 
     spark_submit_command.append(f"--log-file={log_file_path}")
+    spark_submit_command.append(f"--resume={request.resume}")
 
     # Call Spark-submit
     try:
@@ -290,8 +292,6 @@ async def send_transaction_status_update(transaction_id: str, status: str, error
             "record_counts": record_counts
         })
 
-
-
 # Helper function to parse error logs
 def parse_error_log(error_log: str) -> str:
     """Parse error log for meaningful messages."""
@@ -327,6 +327,30 @@ def extract_record_counts_from_log(error_log: str) -> dict:
         record_counts["hudi_count"] = int(hudi_count_match.group(1))
 
     return record_counts
+
+@app.get("/bootstrap_status/{transaction_id}/")
+async def bootstrap_status(transaction_id: str, db: Session = Depends(get_db)):
+    # Query the transaction from the database
+    transaction = db.query(HudiTransaction).filter(HudiTransaction.transaction_id == transaction_id).first()
+
+    if not transaction:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
+
+    # Parse the error log for meaningful error messages
+    error_message = None
+    if transaction.error_log:
+        error_message = parse_error_log(transaction.error_log)
+    record_counts = extract_record_counts_from_log(transaction.error_log)
+
+    # Extract record counts from the error_log   
+
+    return {
+        "status": transaction.status,
+        "error_log": transaction.error_log,
+        "error_message": error_message,
+        "record_counts": record_counts
+    }
+
 
 # Pydantic model to check path or table
 class PathOrTableCheck(BaseModel):

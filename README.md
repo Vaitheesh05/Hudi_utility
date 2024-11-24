@@ -1,4 +1,5 @@
-![Screenshot 2024-11-24 160105](https://github.com/user-attachments/assets/16b02d85-7896-4ad9-b90e-8a5399e30ea9)
+![hudi](https://github.com/user-attachments/assets/cd7ce640-eb4e-45f9-9350-eab17df33389)
+
 
 # Hudi Bootstrap Application
 
